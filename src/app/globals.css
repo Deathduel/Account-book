@@ -42,3 +42,7 @@ body {
 .safe-pb {
   padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
 }
+
+.mobile-bottom-lift {
+  padding-bottom: calc(64px + env(safe-area-inset-bottom));
+}

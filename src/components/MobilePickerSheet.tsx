@@ -60,7 +60,7 @@ export default function MobilePickerSheet({ request, onClose, onConfirm }: Props
     return (
       <div className="fixed inset-0 z-50 bg-black/40 flex items-end justify-center" onClick={onClose}>
         <div
-          className="w-full max-w-md bg-white rounded-t-2xl overflow-hidden text-[#222222] safe-pb"
+          className="w-full max-w-md bg-white rounded-t-2xl overflow-hidden text-[#222222] mobile-bottom-lift"
           onClick={(e) => e.stopPropagation()}
         >
           <div className="px-4 py-3 border-b border-[#F0F0F0] flex items-center justify-between text-sm">
@@ -105,7 +105,7 @@ export default function MobilePickerSheet({ request, onClose, onConfirm }: Props
     return (
       <div className="fixed inset-0 z-50 bg-black/40 flex items-end justify-center" onClick={onClose}>
         <div
-          className="w-full max-w-md bg-white rounded-t-2xl overflow-hidden text-[#222222] safe-pb"
+          className="w-full max-w-md bg-white rounded-t-2xl overflow-hidden text-[#222222] mobile-bottom-lift"
           onClick={(e) => e.stopPropagation()}
         >
           <div className="px-4 py-3 border-b border-[#F0F0F0] flex items-center justify-between text-sm">
@@ -176,7 +176,7 @@ export default function MobilePickerSheet({ request, onClose, onConfirm }: Props
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-end justify-center" onClick={onClose}>
       <div
-        className="w-full max-w-md bg-white rounded-t-2xl overflow-hidden text-[#222222] safe-pb"
+        className="w-full max-w-md bg-white rounded-t-2xl overflow-hidden text-[#222222] mobile-bottom-lift"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-4 py-3 border-b border-[#F0F0F0] flex items-center justify-between text-sm">

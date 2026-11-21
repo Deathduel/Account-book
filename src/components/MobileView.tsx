@@ -330,7 +330,7 @@ export default function MobileView({
       { id: 'export', label: '导出' },
     ];
     return (
-      <nav className="fixed bottom-0 inset-x-0 z-30 bg-white border-t border-[#EFEFEF] px-2 pt-1.5 safe-pb grid grid-cols-5 items-end text-[#333333]">
+      <nav className="fixed bottom-0 inset-x-0 z-30 bg-white border-t border-[#EFEFEF] px-2 pt-2 mobile-bottom-lift grid grid-cols-5 items-end text-[#333333]">
         {tabs.map((it) => {
           const tabId = it.id;
           if (tabId === 'ADD') {
@@ -420,7 +420,7 @@ export default function MobileView({
     const dates = Array.from(grouped.keys()).sort((a, b) => b.localeCompare(a));
 
     return (
-      <div className="min-h-screen bg-[#F7F8FA] pb-20 flex flex-col">
+      <div className="min-h-screen bg-[#F7F8FA] pb-36 flex flex-col">
         <header className="shark-yellow px-4 pt-3 pb-5 sticky top-0 z-20">
           <div className="flex items-center justify-between mb-3">
             <div className="text-[11px] text-[#555555] flex items-center gap-1">
@@ -704,7 +704,7 @@ export default function MobileView({
         </div>
 
         {batchMode ? (
-          <div className="fixed bottom-0 inset-x-0 z-30 bg-white border-t border-[#EFEFEF] px-4 py-3 safe-pb flex items-center justify-between shadow-lg">
+          <div className="fixed bottom-0 inset-x-0 z-30 bg-white border-t border-[#EFEFEF] px-4 pt-3 mobile-bottom-lift flex items-center justify-between shadow-lg">
             <button
               type="button"
               onClick={() => {
@@ -843,7 +843,7 @@ export default function MobileView({
         : `${chartYear}年`;
 
     return (
-      <div className="min-h-screen bg-white pb-20 flex flex-col relative">
+      <div className="min-h-screen bg-white pb-36 flex flex-col relative">
         <header className="shark-yellow px-4 pt-3 pb-3 sticky top-0 z-20">
           <div className="flex items-center justify-between mb-2.5">
             <div className="w-16" />
@@ -1237,7 +1237,7 @@ export default function MobileView({
         </div>
 
         {/* Bottom Recent Notes + Note Input + Calculator Keypad */}
-        <div className="border-t border-[#ECECEC] bg-[#F7F8FA] p-2.5 safe-pb space-y-2 shrink-0">
+        <div className="border-t border-[#ECECEC] bg-[#F7F8FA] px-2.5 pt-2.5 mobile-bottom-lift space-y-2 shrink-0">
           {recentNotes.length > 0 && (
             <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar px-0.5">
               <span className="text-[11px] text-[#999999] shrink-0">常用备注:</span>
@@ -1365,7 +1365,7 @@ export default function MobileView({
     const allBal = allInc - allExp;
 
     return (
-      <div className="min-h-screen bg-white pb-20 flex flex-col text-[#222222]">
+      <div className="min-h-screen bg-white pb-36 flex flex-col text-[#222222]">
         <header className="px-4 py-3 flex items-center justify-between border-b border-[#F0F0F0] sticky top-0 bg-white z-20">
           {billTab === 'month' ? (
             <button
@@ -1573,7 +1573,7 @@ export default function MobileView({
       .slice(0, 3);
 
     return (
-      <div className="min-h-screen bg-[#F7F8FA] text-[#222222] flex flex-col">
+      <div className="min-h-screen bg-[#F7F8FA] pb-20 text-[#222222] flex flex-col">
         <header className="bg-white px-4 py-3 flex items-center justify-between border-b border-[#EFEFEF] sticky top-0 z-20">
           <button type="button" onClick={() => goScreen('bill')} className="text-sm font-medium">
             ← 返回
@@ -1749,7 +1749,7 @@ export default function MobileView({
     const catEntries = Object.entries(budget.categories);
 
     return (
-      <div className="min-h-screen bg-[#F7F8FA] text-[#222222] flex flex-col">
+      <div className="min-h-screen bg-[#F7F8FA] pb-20 text-[#222222] flex flex-col">
         <header className="shark-yellow px-4 py-3 flex items-center justify-between sticky top-0 z-20">
           <button
             type="button"
@@ -2095,7 +2095,7 @@ export default function MobileView({
     };
 
     return (
-      <div className="min-h-screen bg-[#F7F8FA] text-[#222222] flex flex-col">
+      <div className="min-h-screen bg-[#F7F8FA] pb-20 text-[#222222] flex flex-col">
         <header className="shark-yellow px-4 py-3 flex items-center justify-between sticky top-0 z-20">
           <button
             type="button"
@@ -2267,7 +2267,7 @@ export default function MobileView({
     const maxAmt = list.length ? Math.max(...list.map((t) => t.amountCents)) : 1;
 
     return (
-      <div className="min-h-screen bg-white text-[#222222] flex flex-col">
+      <div className="min-h-screen bg-white pb-20 text-[#222222] flex flex-col">
         <header className="px-4 py-3 flex items-center justify-between border-b border-[#F2F2F2] sticky top-0 bg-white z-20">
           <button type="button" onClick={() => goScreen('feed')} className="text-base font-medium">
             ←
@@ -2376,7 +2376,7 @@ export default function MobileView({
     const selInc = selTxs.filter((t) => t.type === 'income').reduce((s, t) => s + t.amountCents, 0);
 
     return (
-      <div className="min-h-screen bg-white text-[#222222] flex flex-col relative pb-16">
+      <div className="min-h-screen bg-white text-[#222222] flex flex-col relative pb-20">
         <header className="shark-yellow px-4 py-2.5 flex items-center justify-between sticky top-0 z-20">
           <button type="button" onClick={() => goScreen('feed')} className="text-base font-semibold">
             ←
@@ -2557,7 +2557,7 @@ export default function MobileView({
   };
 
   return (
-    <div className="min-h-screen bg-[#F7F8FA] pb-20 text-[#222222] flex flex-col">
+    <div className="min-h-screen bg-[#F7F8FA] pb-36 text-[#222222] flex flex-col">
       <header className="shark-yellow px-4 pt-3 pb-3 sticky top-0 z-20 space-y-2.5">
         <div className="text-center text-sm font-bold">账单导入 / 导出</div>
         <div className="grid grid-cols-2 rounded-lg overflow-hidden border border-[#333333] text-xs font-medium">
