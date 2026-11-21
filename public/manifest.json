@@ -1,0 +1,18 @@
+{
+  "name": "简账 · 个人记账本",
+  "short_name": "简账",
+  "description": "极简个人收支记账本 · 手机极速记账 + 电脑宽屏复盘",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#FFDA44",
+  "theme_color": "#FFDA44",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

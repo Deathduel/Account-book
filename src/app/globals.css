@@ -1,0 +1,44 @@
+@import "tailwindcss";
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Segoe UI", Roboto, sans-serif;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.shark-yellow {
+  background-color: #FFDA44;
+}
+
+.shark-yellow-soft {
+  background-color: #FFF8D6;
+}
+
+.shark-dark {
+  background-color: #333333;
+  color: #FFFFFF;
+}
+
+.safe-pb {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
