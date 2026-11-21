@@ -19,9 +19,20 @@ export interface Transaction {
   createdAt?: string;
 }
 
+export interface RecurringTemplate {
+  id: string;
+  type: TxType;
+  categoryId: string;
+  amountCents: number;
+  note: string;
+  dayOfMonth: number; // 1 - 28
+}
+
 export interface BudgetSettings {
-  monthlyCents: number;
+  monthlyCents: number; // Global default monthly budget
+  monthlyOverrides: Record<string, number>; // 'YYYY-MM' -> limitCents (per-month override)
   categories: Record<string, number>; // categoryId -> limitCents
+  recurringTemplates: RecurringTemplate[]; // Fixed monthly bill templates
 }
 
 export interface StorageSnapshot {

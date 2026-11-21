@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   ALL_CATEGORIES,
   EXPENSE_CATEGORIES,
@@ -10,6 +10,7 @@ import {
 import {
   buildRealChartData,
   getAllYearRows,
+  getEffectiveMonthlyBudget,
   getMonthTotals,
   getYearMonthRows,
 } from '@/lib/analytics';
@@ -31,11 +32,11 @@ import {
   readCsvFileText,
   type CsvParseResult,
 } from '@/lib/csvImport';
-import type { BudgetSettings, Transaction, TxType } from '@/lib/types';
+import type { BudgetSettings, RecurringTemplate, Transaction, TxType } from '@/lib/types';
 import type { TxDraft } from './BookkeepingApp';
 import SharkLineChart from './SharkLineChart';
 
-type DesktopTab = 'overview' | 'charts' | 'bill' | 'calendar' | 'budget';
+type DesktopTab = 'overview' | 'charts' | 'bill' | 'calendar' | 'budget' | 'recurring';
 
 interface Props {
   transactions: Transaction[];
@@ -46,6 +47,7 @@ interface Props {
   onCreateTx: (draft: TxDraft) => Promise<Transaction | null>;
   onUpdateTx: (id: number, patch: Partial<TxDraft>) => Promise<Transaction | null>;
   onDeleteTx: (id: number) => Promise<boolean>;
+  onBatchDeleteTx: (ids: number[]) => Promise<boolean>;
   onImportTx: (
     items: TxDraft[],
     skipDuplicates?: boolean,
@@ -79,6 +81,7 @@ export default function DesktopView({
   onCreateTx,
   onUpdateTx,
   onDeleteTx,
+  onBatchDeleteTx,
   onImportTx,
   onSaveBudget,
   onSeedSamples,
@@ -113,15 +116,34 @@ export default function DesktopView({
   const [chartWeekIdx, setChartWeekIdx] = useState(recentWeeks.length - 1);
   const [chartYear, setChartYear] = useState(todayYear);
   const [chartMonth, setChartMonth] = useState(todayMonth);
+  const [expandedChartCatId, setExpandedChartCatId] = useState<string | null>(null);
 
   // Bill state
   const [billTab, setBillTab] = useState<'month' | 'year'>('month');
   const [billYear, setBillYear] = useState(todayYear);
 
-  // Budget editing
-  const [totalBudgetDraft, setTotalBudgetDraft] = useState((budget.monthlyCents / 100).toFixed(2));
+  // Budget editing (Global default + Per-month override)
+  const effectiveBudget = getEffectiveMonthlyBudget(budget, viewYear, viewMonth);
+  const [defaultBudgetDraft, setDefaultBudgetDraft] = useState((budget.monthlyCents / 100).toFixed(2));
+  const [monthBudgetDraft, setMonthBudgetDraft] = useState((effectiveBudget.limitCents / 100).toFixed(2));
   const [newCatBudgetId, setNewCatBudgetId] = useState(EXPENSE_CATEGORIES[0].id);
   const [newCatBudgetYuan, setNewCatBudgetYuan] = useState('500');
+
+  useEffect(() => {
+    setDefaultBudgetDraft((budget.monthlyCents / 100).toFixed(2));
+    setMonthBudgetDraft((effectiveBudget.limitCents / 100).toFixed(2));
+  }, [budget.monthlyCents, effectiveBudget.limitCents, viewYear, viewMonth]);
+
+  // Recurring template form
+  const [recType, setRecType] = useState<TxType>('expense');
+  const [recCatId, setRecCatId] = useState('c_zhufang');
+  const [recAmount, setRecAmount] = useState('');
+  const [recDay, setRecDay] = useState('5');
+  const [recNote, setRecNote] = useState('');
+
+  // Batch delete state
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [confirmBatchDeleteOpen, setConfirmBatchDeleteOpen] = useState(false);
 
   // Import CSV modal state
   const [importModalOpen, setImportModalOpen] = useState(false);
@@ -211,7 +233,7 @@ export default function DesktopView({
     setQaAmount('');
     setQaNote('');
     setQuickAddOpen(false);
-    showToast('已记一笔并同步');
+    showToast('已记一笔');
   };
 
   const handleExport = (scope: 'month' | 'all') => {
@@ -248,6 +270,43 @@ export default function DesktopView({
     }
   };
 
+  const handleAddTemplate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const n = parseFloat(recAmount);
+    if (Number.isNaN(n) || n <= 0) {
+      showToast('请输入有效金额');
+      return;
+    }
+    const nextItem: RecurringTemplate = {
+      id: `tpl_${Date.now()}`,
+      type: recType,
+      categoryId: recCatId,
+      amountCents: Math.round(n * 100),
+      note: recNote.trim(),
+      dayOfMonth: Math.min(28, Math.max(1, Number(recDay) || 1)),
+    };
+    await onSaveBudget({
+      ...budget,
+      recurringTemplates: [...(budget.recurringTemplates || []), nextItem],
+    });
+    setRecAmount('');
+    setRecNote('');
+  };
+
+  const handleApplyTemplates = async () => {
+    const templates = budget.recurringTemplates || [];
+    if (templates.length === 0) return;
+    const maxD = daysInMonth(viewYear, viewMonth);
+    const drafts: TxDraft[] = templates.map((tpl) => ({
+      type: tpl.type,
+      categoryId: tpl.categoryId,
+      amountCents: tpl.amountCents,
+      date: `${viewYear}-${pad2(viewMonth)}-${pad2(Math.min(tpl.dayOfMonth, maxD))}`,
+      note: tpl.note || getCategory(tpl.categoryId).name,
+    }));
+    await onImportTx(drafts, true);
+  };
+
   const presetMonths: { y: number; m: number; label: string }[] = [];
   for (let i = 5; i >= 0; i--) {
     const d = new Date(todayYear, todayMonth - 1 - i, 1);
@@ -258,7 +317,7 @@ export default function DesktopView({
 
   const totalDaysInCal = daysInMonth(viewYear, viewMonth);
   const firstCalWeekday = new Date(viewYear, viewMonth - 1, 1).getDay();
-  const dailyBudget = Math.round(budget.monthlyCents / totalDaysInCal);
+  const dailyBudget = Math.round(effectiveBudget.limitCents / totalDaysInCal);
 
   return (
     <div className="min-h-screen bg-[#F7F8FA] text-[#222222]">
@@ -272,9 +331,17 @@ export default function DesktopView({
             <div>
               <div className="font-bold text-sm leading-tight">简账 · 电脑复盘工作台</div>
               <div className="text-xs text-[#888888] flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-[#22C55E] inline-block" />
+                <span
+                  className={`w-2 h-2 rounded-full inline-block ${
+                    syncing ? 'bg-[#F59E0B] animate-pulse' : 'bg-[#22C55E]'
+                  }`}
+                />
                 <span>
-                  {storageMode === 'supabase' ? 'Supabase 云端实时同步' : '本地持久化存储 (data/ledger.json)'}
+                  {syncing
+                    ? '正在后台同步...'
+                    : storageMode === 'supabase'
+                    ? 'Supabase 云端实时同步'
+                    : '本地持久化存储 (data/ledger.json)'}
                 </span>
               </div>
             </div>
@@ -283,7 +350,10 @@ export default function DesktopView({
           <div className="flex items-center gap-2.5">
             <select
               value={viewYear}
-              onChange={(e) => setViewYear(Number(e.target.value))}
+              onChange={(e) => {
+                setViewYear(Number(e.target.value));
+                setSelectedIds([]);
+              }}
               className="bg-[#F7F8FA] border border-[#E5E5E5] rounded-lg px-2.5 py-1.5 text-xs font-semibold tabular-nums"
             >
               {YEAR_OPTIONS.map((y) => (
@@ -294,7 +364,10 @@ export default function DesktopView({
             </select>
             <select
               value={viewMonth}
-              onChange={(e) => setViewMonth(Number(e.target.value))}
+              onChange={(e) => {
+                setViewMonth(Number(e.target.value));
+                setSelectedIds([]);
+              }}
               className="bg-[#F7F8FA] border border-[#E5E5E5] rounded-lg px-2.5 py-1.5 text-xs font-semibold tabular-nums"
             >
               {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
@@ -336,6 +409,7 @@ export default function DesktopView({
                 ['bill', '🧾', '月/年账单'],
                 ['calendar', '📅', '日历复盘'],
                 ['budget', '🎯', '预算管理'],
+                ['recurring', '📌', '固定月账单'],
               ] as const
             ).map(([id, icon, lbl]) => (
               <button
@@ -373,7 +447,7 @@ export default function DesktopView({
 
           <div className="bg-white border border-[#EAEAEA] rounded-2xl p-3.5 space-y-2 shadow-sm">
             <div className="text-xs font-semibold">导入 / 导出（5列）</div>
-            <div className="text-[11px] text-[#888888]">时间 · 支出/收入 · 用途 · 金额 · 备注</div>
+            <div className="text-[11px] text-[#888888]">支持微信 / 支付宝 / 标准CSV</div>
             <button
               type="button"
               onClick={() => setImportModalOpen(true)}
@@ -468,8 +542,7 @@ export default function DesktopView({
                 />
                 <button
                   type="submit"
-                  disabled={syncing}
-                  className="px-5 py-2 rounded-lg shark-yellow text-xs font-bold text-[#222222] disabled:opacity-50"
+                  className="px-5 py-2 rounded-lg shark-yellow text-xs font-bold text-[#222222]"
                 >
                   保存
                 </button>
@@ -504,13 +577,13 @@ export default function DesktopView({
             </div>
             <div>
               <div className="text-xs text-[#555555] flex justify-between">
-                <span>月预算剩余</span>
+                <span>月预算剩余{effectiveBudget.isOverride ? ' (本月专属)' : ''}</span>
                 <button type="button" onClick={() => setTab('budget')} className="underline">
                   编辑
                 </button>
               </div>
               <div className="text-2xl font-bold mt-1">
-                <SplitMoney cents={budget.monthlyCents - monthTotals.exp} />
+                <SplitMoney cents={effectiveBudget.limitCents - monthTotals.exp} />
               </div>
             </div>
           </div>
@@ -541,98 +614,160 @@ export default function DesktopView({
                   </select>
                 </div>
 
-                {filteredList.length > 0 ? (
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-xs text-left">
-                      <thead className="bg-[#FAFAFA] text-[#888888] border-b border-[#F0F0F0]">
-                        <tr>
-                          <th className="py-2.5 px-4 font-normal">日期</th>
-                          <th className="py-2.5 px-3 font-normal">分类</th>
-                          <th className="py-2.5 px-3 font-normal">备注（失焦自动保存）</th>
-                          <th className="py-2.5 px-4 font-normal text-right">金额</th>
-                          <th className="py-2.5 px-3 font-normal text-right">操作</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-[#F5F5F5]">
-                        {filteredList.map((tx) => {
-                          const sameCats = getCategoriesByType(tx.type);
-                          return (
-                            <tr key={tx.id} className="hover:bg-[#FAFAFA]">
-                              <td className="py-2.5 px-4 tabular-nums text-[#888888] whitespace-nowrap">
-                                {tx.date}
-                              </td>
-                              <td className="py-2.5 px-3 whitespace-nowrap">
-                                <select
-                                  value={tx.categoryId}
-                                  onChange={(e) => onUpdateTx(tx.id, { categoryId: e.target.value })}
-                                  className="bg-[#F7F8FA] border border-[#EAEAEA] rounded px-2 py-1 text-xs"
-                                >
-                                  {sameCats.map((c) => (
-                                    <option key={c.id} value={c.id}>
-                                      {c.icon} {c.name}
-                                    </option>
-                                  ))}
-                                </select>
-                              </td>
-                              <td className="py-2.5 px-3">
-                                <input
-                                  type="text"
-                                  defaultValue={tx.note}
-                                  onBlur={(e) => {
-                                    if (e.target.value.trim() !== tx.note) {
-                                      onUpdateTx(tx.id, { note: e.target.value.trim() });
-                                    }
-                                  }}
-                                  placeholder="—"
-                                  className="w-full bg-transparent hover:bg-[#F5F5F5] focus:bg-[#F5F5F5] rounded px-1.5 py-0.5 text-xs focus:outline-none"
-                                />
-                              </td>
-                              <td className="py-2.5 px-4 text-right font-semibold tabular-nums whitespace-nowrap">
-                                {tx.type === 'income' ? '+' : '-'}
-                                {fmtNum(tx.amountCents)}
-                              </td>
-                              <td className="py-2.5 px-3 text-right whitespace-nowrap">
-                                <button
-                                  type="button"
-                                  onClick={() => onDeleteTx(tx.id)}
-                                  className="text-[#E53935] hover:underline"
-                                >
-                                  删除
-                                </button>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                ) : (
-                  <div className="py-16 text-center space-y-3">
-                    <div className="text-3xl">📝</div>
-                    <div className="text-xs text-[#999999]">
-                      {viewYear}年{viewMonth}月 暂无符合条件的账单
-                    </div>
-                    <div className="flex justify-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setQuickAddOpen(true)}
-                        className="px-4 py-2 rounded-xl shark-yellow text-xs font-bold text-[#222222]"
-                      >
-                        + 记一笔
-                      </button>
-                      {transactions.length === 0 && (
-                        <button
-                          type="button"
-                          disabled={syncing}
-                          onClick={onSeedSamples}
-                          className="px-4 py-2 rounded-xl bg-[#F5F5F5] text-xs font-medium text-[#555555]"
-                        >
-                          填入示例数据
-                        </button>
+                {(() => {
+                  const visibleIds = filteredList.map((t) => t.id);
+                  const visibleSelectedIds = selectedIds.filter((id) => visibleIds.includes(id));
+                  const allVisibleSelected =
+                    visibleIds.length > 0 && visibleSelectedIds.length === visibleIds.length;
+
+                  return (
+                    <>
+                      {visibleSelectedIds.length > 0 && (
+                        <div className="px-4 py-2.5 bg-[#FFFDF0] border-b border-[#F5E38A] flex items-center justify-between text-xs">
+                          <span className="text-[#333333]">
+                            已选中 <strong className="tabular-nums">{visibleSelectedIds.length}</strong> 条账单
+                          </span>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setSelectedIds([])}
+                              className="px-2.5 py-1 rounded-lg bg-white border border-[#E5E5E5] text-[#666666] hover:bg-[#FAFAFA]"
+                            >
+                              取消选择
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmBatchDeleteOpen(true)}
+                              className="px-3 py-1 rounded-lg bg-[#E53935] text-white font-semibold hover:opacity-90"
+                            >
+                              批量删除 ({visibleSelectedIds.length})
+                            </button>
+                          </div>
+                        </div>
                       )}
-                    </div>
-                  </div>
-                )}
+
+                      {filteredList.length > 0 ? (
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-xs text-left">
+                            <thead className="bg-[#FAFAFA] text-[#888888] border-b border-[#F0F0F0]">
+                              <tr>
+                                <th className="py-2.5 pl-4 pr-1 w-8">
+                                  <input
+                                    type="checkbox"
+                                    checked={allVisibleSelected}
+                                    onChange={() => setSelectedIds(allVisibleSelected ? [] : visibleIds)}
+                                    title="全选当前列表"
+                                    className="cursor-pointer"
+                                  />
+                                </th>
+                                <th className="py-2.5 px-3 font-normal">日期</th>
+                                <th className="py-2.5 px-3 font-normal">分类</th>
+                                <th className="py-2.5 px-3 font-normal">备注（失焦自动保存）</th>
+                                <th className="py-2.5 px-4 font-normal text-right">金额</th>
+                                <th className="py-2.5 px-3 font-normal text-right">操作</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-[#F5F5F5]">
+                              {filteredList.map((tx) => {
+                                const sameCats = getCategoriesByType(tx.type);
+                                const isChecked = visibleSelectedIds.includes(tx.id);
+                                return (
+                                  <tr
+                                    key={tx.id}
+                                    className={isChecked ? 'bg-[#FFFDF0]' : 'hover:bg-[#FAFAFA]'}
+                                  >
+                                    <td className="py-2.5 pl-4 pr-1">
+                                      <input
+                                        type="checkbox"
+                                        checked={isChecked}
+                                        onChange={() =>
+                                          setSelectedIds((prev) =>
+                                            prev.includes(tx.id)
+                                              ? prev.filter((id) => id !== tx.id)
+                                              : [...prev, tx.id],
+                                          )
+                                        }
+                                        className="cursor-pointer"
+                                      />
+                                    </td>
+                                    <td className="py-2.5 px-3 tabular-nums text-[#888888] whitespace-nowrap">
+                                      {tx.date}
+                                    </td>
+                                    <td className="py-2.5 px-3 whitespace-nowrap">
+                                      <select
+                                        value={tx.categoryId}
+                                        onChange={(e) => onUpdateTx(tx.id, { categoryId: e.target.value })}
+                                        className="bg-[#F7F8FA] border border-[#EAEAEA] rounded px-2 py-1 text-xs"
+                                      >
+                                        {sameCats.map((c) => (
+                                          <option key={c.id} value={c.id}>
+                                            {c.icon} {c.name}
+                                          </option>
+                                        ))}
+                                      </select>
+                                    </td>
+                                    <td className="py-2.5 px-3">
+                                      <input
+                                        type="text"
+                                        defaultValue={tx.note}
+                                        onBlur={(e) => {
+                                          if (e.target.value.trim() !== tx.note) {
+                                            onUpdateTx(tx.id, { note: e.target.value.trim() });
+                                          }
+                                        }}
+                                        placeholder="—"
+                                        className="w-full bg-transparent hover:bg-[#F5F5F5] focus:bg-[#F5F5F5] rounded px-1.5 py-0.5 text-xs focus:outline-none"
+                                      />
+                                    </td>
+                                    <td className="py-2.5 px-4 text-right font-semibold tabular-nums whitespace-nowrap">
+                                      {tx.type === 'income' ? '+' : '-'}
+                                      {fmtNum(tx.amountCents)}
+                                    </td>
+                                    <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                                      <button
+                                        type="button"
+                                        onClick={() => onDeleteTx(tx.id)}
+                                        className="text-[#E53935] hover:underline"
+                                      >
+                                        删除
+                                      </button>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : (
+                        <div className="py-16 text-center space-y-3">
+                          <div className="text-3xl">📝</div>
+                          <div className="text-xs text-[#999999]">
+                            {viewYear}年{viewMonth}月 暂无符合条件的账单
+                          </div>
+                          <div className="flex justify-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setQuickAddOpen(true)}
+                              className="px-4 py-2 rounded-xl shark-yellow text-xs font-bold text-[#222222]"
+                            >
+                              + 记一笔
+                            </button>
+                            {transactions.length === 0 && (
+                              <button
+                                type="button"
+                                disabled={syncing}
+                                onClick={onSeedSamples}
+                                className="px-4 py-2 rounded-xl bg-[#F5F5F5] text-xs font-medium text-[#555555]"
+                              >
+                                填入示例数据
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
 
               {/* Right Category Ranking */}
@@ -655,7 +790,13 @@ export default function DesktopView({
                         Math.round((item.cents / (overviewRank[0]?.cents || 1)) * 100),
                       );
                       return (
-                        <div key={item.cat.id} className="flex items-center gap-2.5">
+                        <button
+                          key={item.cat.id}
+                          type="button"
+                          onClick={() => setCatFilter((prev) => (prev === item.cat.id ? 'all' : item.cat.id))}
+                          className="w-full flex items-center gap-2.5 text-left hover:opacity-80"
+                          title="点击筛选左侧该分类明细"
+                        >
                           <span className="w-7 h-7 rounded-full bg-[#F5F5F5] flex items-center justify-center text-sm shrink-0">
                             {item.cat.icon}
                           </span>
@@ -671,7 +812,7 @@ export default function DesktopView({
                               <div className="h-full rounded-full shark-yellow" style={{ width: `${w}%` }} />
                             </div>
                           </div>
-                        </div>
+                        </button>
                       );
                     })}
                   </div>
@@ -682,14 +823,17 @@ export default function DesktopView({
             </div>
           )}
 
-          {/* TAB: CHARTS */}
+          {/* TAB: CHARTS (With Category Drill-Down) */}
           {tab === 'charts' && (
             <div className="bg-white border border-[#EAEAEA] rounded-2xl p-5 shadow-sm space-y-4">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setChartType('expense')}
+                    onClick={() => {
+                      setChartType('expense');
+                      setExpandedChartCatId(null);
+                    }}
                     className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold ${
                       chartType === 'expense' ? 'shark-yellow' : 'bg-[#F5F5F5] text-[#666666]'
                     }`}
@@ -698,7 +842,10 @@ export default function DesktopView({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setChartType('income')}
+                    onClick={() => {
+                      setChartType('income');
+                      setExpandedChartCatId(null);
+                    }}
                     className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold ${
                       chartType === 'income' ? 'shark-yellow' : 'bg-[#F5F5F5] text-[#666666]'
                     }`}
@@ -718,7 +865,10 @@ export default function DesktopView({
                     <button
                       key={k}
                       type="button"
-                      onClick={() => setChartScope(k)}
+                      onClick={() => {
+                        setChartScope(k);
+                        setExpandedChartCatId(null);
+                      }}
                       className={`py-1 ${chartScope === k ? 'shark-dark' : 'bg-white text-[#333333]'}`}
                     >
                       {lbl}
@@ -727,14 +877,16 @@ export default function DesktopView({
                 </div>
               </div>
 
-              {/* Clickable Period Bar */}
               {chartScope === 'week' && (
                 <div className="flex items-center gap-2 border-b border-[#EFEFEF] text-xs text-[#888888]">
                   {recentWeeks.map((w, idx) => (
                     <button
                       key={w.start}
                       type="button"
-                      onClick={() => setChartWeekIdx(idx)}
+                      onClick={() => {
+                        setChartWeekIdx(idx);
+                        setExpandedChartCatId(null);
+                      }}
                       className={`py-2 px-3 ${
                         idx === chartWeekIdx
                           ? 'text-[#222222] font-semibold border-b-2 border-[#333333]'
@@ -757,6 +909,7 @@ export default function DesktopView({
                         onClick={() => {
                           setChartYear(p.y);
                           setChartMonth(p.m);
+                          setExpandedChartCatId(null);
                         }}
                         className={`py-2 px-3 ${
                           chartYear === p.y && chartMonth === p.m
@@ -771,7 +924,10 @@ export default function DesktopView({
                   <div className="flex items-center gap-1.5 py-1">
                     <select
                       value={chartYear}
-                      onChange={(e) => setChartYear(Number(e.target.value))}
+                      onChange={(e) => {
+                        setChartYear(Number(e.target.value));
+                        setExpandedChartCatId(null);
+                      }}
                       className="bg-[#F5F5F5] rounded px-2 py-1 text-xs font-medium text-[#222222] tabular-nums"
                     >
                       {YEAR_OPTIONS.map((y) => (
@@ -782,7 +938,10 @@ export default function DesktopView({
                     </select>
                     <select
                       value={chartMonth}
-                      onChange={(e) => setChartMonth(Number(e.target.value))}
+                      onChange={(e) => {
+                        setChartMonth(Number(e.target.value));
+                        setExpandedChartCatId(null);
+                      }}
                       className="bg-[#F5F5F5] rounded px-2 py-1 text-xs font-medium text-[#222222] tabular-nums"
                     >
                       {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
@@ -802,7 +961,10 @@ export default function DesktopView({
                       <button
                         key={y}
                         type="button"
-                        onClick={() => setChartYear(y)}
+                        onClick={() => {
+                          setChartYear(y);
+                          setExpandedChartCatId(null);
+                        }}
                         className={`py-2 px-3 ${
                           chartYear === y
                             ? 'text-[#222222] font-semibold border-b-2 border-[#333333]'
@@ -815,7 +977,10 @@ export default function DesktopView({
                   </div>
                   <select
                     value={chartYear}
-                    onChange={(e) => setChartYear(Number(e.target.value))}
+                    onChange={(e) => {
+                      setChartYear(Number(e.target.value));
+                      setExpandedChartCatId(null);
+                    }}
                     className="bg-[#F5F5F5] rounded px-2 py-1 text-xs font-medium text-[#222222] tabular-nums"
                   >
                     {YEAR_OPTIONS.map((y) => (
@@ -827,47 +992,108 @@ export default function DesktopView({
                 </div>
               )}
 
-              <div className="text-xs text-[#666666]">
-                总{chartType === 'expense' ? '支出' : '收入'}:{' '}
-                <strong className="text-[#222222] text-sm tabular-nums">
-                  {fmtNum(chartData.total, true)}
-                </strong>{' '}
-                · 平均值: <span className="tabular-nums">{fmtNum(chartData.avg, true)}</span>
+              <div className="flex items-center justify-between text-xs text-[#666666]">
+                <div>
+                  总{chartType === 'expense' ? '支出' : '收入'}:{' '}
+                  <strong className="text-[#222222] text-sm tabular-nums">
+                    {fmtNum(chartData.total, true)}
+                  </strong>{' '}
+                  · 平均值: <span className="tabular-nums">{fmtNum(chartData.avg, true)}</span>
+                </div>
+                <span className="text-[#999999]">点击下方任意分类展开明细</span>
               </div>
 
               <SharkLineChart points={chartData.points} avg={chartData.avg} width={760} height={175} />
 
-              <div className="pt-3 border-t border-[#F0F0F0]">
+              <div className="pt-3 border-t border-[#F0F0F0] space-y-4">
                 {chartData.rankList.length > 0 ? (
-                  <div className="grid grid-cols-2 gap-4">
-                    {chartData.rankList.map((item) => {
-                      const maxRank = chartData.rankList[0]?.cents || 1;
-                      return (
-                        <div key={item.cat.id} className="flex items-center gap-3">
-                          <span className="w-8 h-8 rounded-full bg-[#F5F5F5] flex items-center justify-center text-base shrink-0">
-                            {item.cat.icon}
-                          </span>
-                          <div className="flex-1 min-w-0">
-                            <div className="flex justify-between text-xs mb-1">
-                              <span className="font-medium">
-                                {item.cat.name}{' '}
-                                <span className="text-[#888888] font-normal ml-1">
-                                  {item.pct.toFixed(1)}%
+                  <>
+                    <div className="grid grid-cols-2 gap-4">
+                      {chartData.rankList.map((item) => {
+                        const maxRank = chartData.rankList[0]?.cents || 1;
+                        const active = expandedChartCatId === item.cat.id;
+                        return (
+                          <button
+                            key={item.cat.id}
+                            type="button"
+                            onClick={() =>
+                              setExpandedChartCatId((prev) =>
+                                prev === item.cat.id ? null : item.cat.id,
+                              )
+                            }
+                            className={`flex items-center gap-3 p-2 rounded-xl text-left transition-colors ${
+                              active ? 'bg-[#FFFDF0] ring-1 ring-[#FFDA44]' : 'hover:bg-[#FAFAFA]'
+                            }`}
+                          >
+                            <span className="w-8 h-8 rounded-full bg-[#F5F5F5] flex items-center justify-center text-base shrink-0">
+                              {item.cat.icon}
+                            </span>
+                            <div className="flex-1 min-w-0">
+                              <div className="flex justify-between text-xs mb-1">
+                                <span className="font-medium">
+                                  {item.cat.name}{' '}
+                                  <span className="text-[#888888] font-normal ml-1">
+                                    {item.pct.toFixed(1)}% · {item.count}笔
+                                  </span>
                                 </span>
-                              </span>
-                              <span className="tabular-nums font-semibold">{fmtNum(item.cents)}</span>
+                                <span className="tabular-nums font-semibold">
+                                  {fmtNum(item.cents)} {active ? '▴' : '▾'}
+                                </span>
+                              </div>
+                              <div className="w-full h-1.5 rounded-full bg-[#F3F3F3] overflow-hidden">
+                                <div
+                                  className="h-full rounded-full shark-yellow"
+                                  style={{
+                                    width: `${Math.max(4, Math.round((item.cents / maxRank) * 100))}%`,
+                                  }}
+                                />
+                              </div>
                             </div>
-                            <div className="w-full h-1.5 rounded-full bg-[#F3F3F3] overflow-hidden">
-                              <div
-                                className="h-full rounded-full shark-yellow"
-                                style={{ width: `${Math.max(4, Math.round((item.cents / maxRank) * 100))}%` }}
-                              />
-                            </div>
-                          </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {expandedChartCatId && (
+                      <div className="bg-[#FAFAFA] rounded-2xl border border-[#EAEAEA] overflow-hidden">
+                        <div className="px-4 py-2.5 border-b border-[#EFEFEF] flex items-center justify-between text-xs">
+                          <span className="font-semibold text-[#222222]">
+                            {getCategory(expandedChartCatId).icon}{' '}
+                            {getCategory(expandedChartCatId).name} · 分类明细下钻
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setExpandedChartCatId(null)}
+                            className="text-[#888888]"
+                          >
+                            收起 ✕
+                          </button>
                         </div>
-                      );
-                    })}
-                  </div>
+                        <div className="divide-y divide-[#F0F0F0] max-h-64 overflow-y-auto">
+                          {chartData.periodTransactions
+                            .filter((t) => t.categoryId === expandedChartCatId)
+                            .sort((a, b) => b.amountCents - a.amountCents)
+                            .map((tx) => (
+                              <div
+                                key={tx.id}
+                                className="px-4 py-2.5 flex items-center justify-between text-xs"
+                              >
+                                <div className="flex items-center gap-3">
+                                  <span className="tabular-nums text-[#888888]">{tx.date}</span>
+                                  <span className="text-[#222222]">
+                                    {tx.note || getCategory(tx.categoryId).name}
+                                  </span>
+                                </div>
+                                <span className="font-semibold tabular-nums">
+                                  {tx.type === 'income' ? '+' : '-'}
+                                  {fmtNum(tx.amountCents)}
+                                </span>
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                    )}
+                  </>
                 ) : (
                   <div className="py-10 text-center text-xs text-[#AAAAAA]">该时间段暂无记录</div>
                 )}
@@ -1063,35 +1289,85 @@ export default function DesktopView({
             </div>
           )}
 
-          {/* TAB: BUDGET */}
+          {/* TAB: BUDGET (Per-Month Override + Global Default + Category Budgets) */}
           {tab === 'budget' && (
             <div className="grid grid-cols-2 gap-4">
-              <div className="bg-white border border-[#EAEAEA] rounded-2xl p-5 shadow-sm space-y-4">
-                <h2 className="text-sm font-bold">月度总预算</h2>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="number"
-                    step="0.01"
-                    value={totalBudgetDraft}
-                    onChange={(e) => setTotalBudgetDraft(e.target.value)}
-                    className="flex-1 border border-[#E5E5E5] rounded-xl px-3 py-2 text-sm tabular-nums"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const n = parseFloat(totalBudgetDraft);
-                      if (!Number.isNaN(n) && n >= 0) {
-                        onSaveBudget({ ...budget, monthlyCents: Math.round(n * 100) });
-                      }
-                    }}
-                    className="px-4 py-2 rounded-xl shark-yellow text-xs font-bold text-[#222222]"
-                  >
-                    保存总预算
-                  </button>
+              <div className="bg-white border border-[#EAEAEA] rounded-2xl p-5 shadow-sm space-y-5">
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-sm font-bold">
+                      {viewYear}年{viewMonth}月 专属预算（不影响历史月份）
+                    </h2>
+                    {effectiveBudget.isOverride && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const nextOverrides = { ...budget.monthlyOverrides };
+                          delete nextOverrides[prefix];
+                          onSaveBudget({ ...budget, monthlyOverrides: nextOverrides });
+                        }}
+                        className="text-xs text-[#888888] underline"
+                      >
+                        恢复使用默认
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={monthBudgetDraft}
+                      onChange={(e) => setMonthBudgetDraft(e.target.value)}
+                      className="flex-1 border border-[#E5E5E5] rounded-xl px-3 py-2 text-sm tabular-nums"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const n = parseFloat(monthBudgetDraft);
+                        if (!Number.isNaN(n) && n >= 0) {
+                          onSaveBudget({
+                            ...budget,
+                            monthlyOverrides: {
+                              ...budget.monthlyOverrides,
+                              [prefix]: Math.round(n * 100),
+                            },
+                          });
+                        }
+                      }}
+                      className="px-4 py-2 rounded-xl shark-yellow text-xs font-bold text-[#222222]"
+                    >
+                      仅存本月
+                    </button>
+                  </div>
+                  <div className="text-xs text-[#666666] tabular-nums">
+                    本月已支出：<strong>¥{fmtNum(monthTotals.exp, true)}</strong> · 剩余：
+                    <strong>¥{fmtNum(effectiveBudget.limitCents - monthTotals.exp, true)}</strong>
+                  </div>
                 </div>
-                <div className="text-xs text-[#666666] tabular-nums">
-                  {viewYear}年{viewMonth}月已支出：<strong>¥{fmtNum(monthTotals.exp, true)}</strong> ·
-                  剩余：<strong>¥{fmtNum(budget.monthlyCents - monthTotals.exp, true)}</strong>
+
+                <div className="pt-4 border-t border-[#F0F0F0] space-y-2.5">
+                  <h3 className="text-xs font-bold text-[#555555]">全局默认月预算（未单独设置的月份使用此值）</h3>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={defaultBudgetDraft}
+                      onChange={(e) => setDefaultBudgetDraft(e.target.value)}
+                      className="flex-1 border border-[#E5E5E5] rounded-xl px-3 py-2 text-sm tabular-nums"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const n = parseFloat(defaultBudgetDraft);
+                        if (!Number.isNaN(n) && n >= 0) {
+                          onSaveBudget({ ...budget, monthlyCents: Math.round(n * 100) });
+                        }
+                      }}
+                      className="px-4 py-2 rounded-xl bg-[#F5F5F5] text-xs font-semibold text-[#333333] hover:bg-[#EAEAEA]"
+                    >
+                      保存默认
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -1180,10 +1456,199 @@ export default function DesktopView({
               </div>
             </div>
           )}
+
+          {/* TAB: RECURRING MONTHLY TEMPLATES */}
+          {tab === 'recurring' && (
+            <div className="grid grid-cols-12 gap-4">
+              <form
+                onSubmit={handleAddTemplate}
+                className="col-span-5 bg-white border border-[#EAEAEA] rounded-2xl p-5 shadow-sm space-y-3 h-fit"
+              >
+                <h2 className="text-sm font-bold">新增固定月账单模板</h2>
+                <p className="text-xs text-[#888888]">
+                  适合每月固定发生的房租、话费、水电、黄金/基金定投、固定工资等。
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  <select
+                    value={recType}
+                    onChange={(e) => {
+                      const t = e.target.value as TxType;
+                      setRecType(t);
+                      setRecCatId(getCategoriesByType(t)[0].id);
+                    }}
+                    className="border border-[#E5E5E5] rounded-xl px-2.5 py-2 text-xs"
+                  >
+                    <option value="expense">支出</option>
+                    <option value="income">收入</option>
+                  </select>
+                  <select
+                    value={recCatId}
+                    onChange={(e) => setRecCatId(e.target.value)}
+                    className="border border-[#E5E5E5] rounded-xl px-2.5 py-2 text-xs"
+                  >
+                    {getCategoriesByType(recType).map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.icon} {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <input
+                    type="number"
+                    step="0.01"
+                    required
+                    value={recAmount}
+                    onChange={(e) => setRecAmount(e.target.value)}
+                    placeholder="金额（元）"
+                    className="border border-[#E5E5E5] rounded-xl px-3 py-2 text-xs tabular-nums"
+                  />
+                  <input
+                    type="number"
+                    min="1"
+                    max="28"
+                    value={recDay}
+                    onChange={(e) => setRecDay(e.target.value)}
+                    placeholder="每月几号 (1-28)"
+                    className="border border-[#E5E5E5] rounded-xl px-3 py-2 text-xs tabular-nums"
+                  />
+                </div>
+                <input
+                  type="text"
+                  value={recNote}
+                  onChange={(e) => setRecNote(e.target.value)}
+                  placeholder="备注说明（如：房租、宽带月租、黄金定投）"
+                  className="w-full border border-[#E5E5E5] rounded-xl px-3 py-2 text-xs"
+                />
+                <button
+                  type="submit"
+                  className="w-full py-2.5 rounded-xl shark-yellow text-xs font-bold text-[#222222]"
+                >
+                  保存模板
+                </button>
+              </form>
+
+              <div className="col-span-7 bg-white border border-[#EAEAEA] rounded-2xl p-5 shadow-sm space-y-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h2 className="text-sm font-bold">
+                      已设固定模板（{(budget.recurringTemplates || []).length} 项）
+                    </h2>
+                    <div className="text-xs text-[#888888]">一键入账自带防重，重复点击不会多记</div>
+                  </div>
+                  {(budget.recurringTemplates || []).length > 0 && (
+                    <button
+                      type="button"
+                      disabled={syncing}
+                      onClick={handleApplyTemplates}
+                      className="px-4 py-2 rounded-xl shark-yellow text-xs font-bold text-[#222222] disabled:opacity-50"
+                    >
+                      一键生成 {viewYear}年{viewMonth}月 固定账单
+                    </button>
+                  )}
+                </div>
+
+                {(budget.recurringTemplates || []).length > 0 ? (
+                  <div className="divide-y divide-[#F5F5F5] border border-[#F0F0F0] rounded-xl overflow-hidden">
+                    {(budget.recurringTemplates || []).map((tpl) => {
+                      const cat = getCategory(tpl.categoryId);
+                      return (
+                        <div
+                          key={tpl.id}
+                          className="px-4 py-3 flex items-center justify-between text-xs hover:bg-[#FAFAFA]"
+                        >
+                          <div className="flex items-center gap-3">
+                            <span className="w-8 h-8 rounded-full bg-[#F5F5F5] flex items-center justify-center text-base">
+                              {cat.icon}
+                            </span>
+                            <div>
+                              <div className="font-semibold text-[#222222]">
+                                {tpl.note || cat.name}
+                              </div>
+                              <div className="text-[#888888]">
+                                每月 {tpl.dayOfMonth} 日 · {cat.name}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-4">
+                            <span className="font-bold tabular-nums text-sm">
+                              {tpl.type === 'income' ? '+' : '-'}
+                              {fmtNum(tpl.amountCents)}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onSaveBudget({
+                                  ...budget,
+                                  recurringTemplates: (budget.recurringTemplates || []).filter(
+                                    (t) => t.id !== tpl.id,
+                                  ),
+                                })
+                              }
+                              className="text-[#E53935] hover:underline"
+                            >
+                              删除
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="py-12 text-center text-xs text-[#AAAAAA]">
+                    暂未添加固定月账单模板，可在左侧快速创建
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </main>
       </div>
 
-      {/* Desktop Import CSV Modal */}
+      {/* Desktop Batch Delete Confirmation Modal */}
+      {confirmBatchDeleteOpen && (() => {
+        const visibleIds = filteredList.map((t) => t.id);
+        const targetIds = selectedIds.filter((id) => visibleIds.includes(id));
+        return (
+          <div
+            className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-6"
+            onClick={() => setConfirmBatchDeleteOpen(false)}
+          >
+            <div
+              className="w-full max-w-sm bg-white rounded-2xl shadow-xl border border-[#EAEAEA] p-5 space-y-4"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="text-base font-bold text-[#222222]">确认批量删除</div>
+              <div className="text-xs text-[#666666] leading-relaxed">
+                确定要删除已选中的 <strong className="text-[#E53935]">{targetIds.length}</strong> 条账单记录吗？删除后将无法恢复。
+              </div>
+              <div className="flex justify-end gap-2 text-xs pt-1">
+                <button
+                  type="button"
+                  onClick={() => setConfirmBatchDeleteOpen(false)}
+                  className="px-4 py-2 rounded-xl bg-[#F5F5F5] font-medium text-[#555555]"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={targetIds.length === 0}
+                  onClick={async () => {
+                    setConfirmBatchDeleteOpen(false);
+                    setSelectedIds([]);
+                    await onBatchDeleteTx(targetIds);
+                  }}
+                  className="px-4 py-2 rounded-xl bg-[#E53935] text-white font-bold disabled:opacity-50"
+                >
+                  确认删除 ({targetIds.length})
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Desktop Import CSV Modal (Supports Standard 5-Col, WeChat Pay, Alipay) */}
       {importModalOpen && (
         <div
           className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-6"
@@ -1194,7 +1659,7 @@ export default function DesktopView({
             onClick={(e) => e.stopPropagation()}
           >
             <div className="shark-yellow px-5 py-3.5 flex items-center justify-between">
-              <div className="text-sm font-bold text-[#222222]">导入 CSV 账单</div>
+              <div className="text-sm font-bold text-[#222222]">导入 CSV 账单（支持微信 / 支付宝 / 标准 5 列）</div>
               <button
                 type="button"
                 onClick={() => setImportModalOpen(false)}
@@ -1206,7 +1671,7 @@ export default function DesktopView({
 
             <div className="p-5 space-y-4">
               <div className="flex items-center justify-between text-xs text-[#666666]">
-                <span>支持列：时间、支出/收入、用途、金额、备注（兼容 UTF-8 与 Excel GBK）</span>
+                <span>自动识别微信支付账单、支付宝账单及本系统 5 列 CSV，自动过滤还款与内部转账</span>
                 <button
                   type="button"
                   onClick={downloadCsvTemplate}
@@ -1240,13 +1705,20 @@ export default function DesktopView({
 
               {importPreview && (
                 <div className="border border-[#EAEAEA] rounded-xl overflow-hidden">
-                  <div className="px-4 py-2.5 bg-[#FAFAFA] border-b border-[#EFEFEF] flex items-center justify-between text-xs">
+                  <div className="px-4 py-2.5 bg-[#FAFAFA] border-b border-[#EFEFEF] flex flex-wrap items-center justify-between gap-2 text-xs">
                     <span className="font-semibold text-[#222222]">
-                      解析完成：有效 {importPreview.items.length} 条
+                      识别来源：【{importPreview.sourceName}】· 有效 {importPreview.items.length} 条
                     </span>
-                    {importPreview.skippedRows > 0 && (
-                      <span className="text-[#E53935]">跳过异常 {importPreview.skippedRows} 行</span>
-                    )}
+                    <div className="flex items-center gap-3">
+                      {importPreview.filteredTransfers > 0 && (
+                        <span className="text-[#666666]">
+                          自动过滤还款/内部流转 {importPreview.filteredTransfers} 条
+                        </span>
+                      )}
+                      {importPreview.skippedRows > 0 && (
+                        <span className="text-[#E53935]">跳过异常 {importPreview.skippedRows} 行</span>
+                      )}
+                    </div>
                   </div>
 
                   {importPreview.errors.length > 0 && (

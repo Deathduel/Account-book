@@ -5,7 +5,9 @@ import { EXPENSE_CATEGORIES, getCategoriesByType, getCategory } from '@/lib/cate
 import {
   buildRealChartData,
   getAllYearRows,
+  getEffectiveMonthlyBudget,
   getMonthTotals,
+  getRecentNotesForCategory,
   getYearMonthRows,
 } from '@/lib/analytics';
 import {
@@ -26,7 +28,7 @@ import {
   readCsvFileText,
   type CsvParseResult,
 } from '@/lib/csvImport';
-import type { BudgetSettings, Transaction, TxType } from '@/lib/types';
+import type { BudgetSettings, RecurringTemplate, Transaction, TxType } from '@/lib/types';
 import type { TxDraft } from './BookkeepingApp';
 import SharkLineChart from './SharkLineChart';
 import MobilePickerSheet, { type PickerKind, type PickerRequest } from './MobilePickerSheet';
@@ -38,6 +40,7 @@ type MobileScreen =
   | 'bill'
   | 'monthReport'
   | 'budget'
+  | 'recurring'
   | 'singleRank'
   | 'calendar'
   | 'export';
@@ -51,6 +54,7 @@ interface Props {
   onCreateTx: (draft: TxDraft) => Promise<Transaction | null>;
   onUpdateTx: (id: number, patch: Partial<TxDraft>) => Promise<Transaction | null>;
   onDeleteTx: (id: number) => Promise<boolean>;
+  onBatchDeleteTx: (ids: number[]) => Promise<boolean>;
   onImportTx: (
     items: TxDraft[],
     skipDuplicates?: boolean,
@@ -81,6 +85,7 @@ export default function MobileView({
   onCreateTx,
   onUpdateTx,
   onDeleteTx,
+  onBatchDeleteTx,
   onImportTx,
   onSaveBudget,
   onSeedSamples,
@@ -98,6 +103,12 @@ export default function MobileView({
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQ, setSearchQ] = useState('');
   const [contextTxId, setContextTxId] = useState<number | null>(null);
+  const [batchMode, setBatchMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [confirmBatchDeleteOpen, setConfirmBatchDeleteOpen] = useState(false);
+
+  // Mobile exclude investment toggle (charts + bill + monthReport)
+  const [excludeInvestment, setExcludeInvestment] = useState(false);
 
   // Charts state
   const [chartType, setChartType] = useState<TxType>('expense');
@@ -106,6 +117,7 @@ export default function MobileView({
   const [chartWeekIdx, setChartWeekIdx] = useState(recentWeeks.length - 1);
   const [chartYear, setChartYear] = useState(todayYear);
   const [chartMonth, setChartMonth] = useState(todayMonth);
+  const [expandedChartCatId, setExpandedChartCatId] = useState<string | null>(null);
 
   // Bill state
   const [billTab, setBillTab] = useState<'month' | 'year'>('month');
@@ -128,12 +140,21 @@ export default function MobileView({
   const [importPreview, setImportPreview] = useState<CsvParseResult | null>(null);
   const [skipDuplicates, setSkipDuplicates] = useState(true);
 
-  // Budget inline editor modal
+  // Budget modals (supports per-month override or global default)
   const [budgetModalOpen, setBudgetModalOpen] = useState(false);
   const [budgetInput, setBudgetInput] = useState('');
+  const [budgetApplyMode, setBudgetApplyMode] = useState<'month' | 'default'>('month');
   const [catBudgetModalOpen, setCatBudgetModalOpen] = useState(false);
   const [catBudgetId, setCatBudgetId] = useState(EXPENSE_CATEGORIES[0].id);
   const [catBudgetInput, setCatBudgetInput] = useState('500');
+
+  // Recurring template form
+  const [recAddOpen, setRecAddOpen] = useState(false);
+  const [recType, setRecType] = useState<TxType>('expense');
+  const [recCatId, setRecCatId] = useState('c_zhufang');
+  const [recAmount, setRecAmount] = useState('');
+  const [recDay, setRecDay] = useState('5');
+  const [recNote, setRecNote] = useState('');
 
   // Add / Edit entry state
   const [editingTxId, setEditingTxId] = useState<number | null>(null);
@@ -150,6 +171,9 @@ export default function MobileView({
     setScreen(next);
     setContextTxId(null);
     setChartTypeMenuOpen(false);
+    setBatchMode(false);
+    setSelectedIds([]);
+    setExpandedChartCatId(null);
   };
 
   const openAdd = (tx?: Transaction, defaultDate?: string) => {
@@ -188,13 +212,17 @@ export default function MobileView({
     if (kind === 'feedYM') {
       setFeedYear(y);
       setFeedMonth(m);
+      setSelectedIds([]);
+      setBatchMode(false);
     } else if (kind === 'billYear') {
       setBillYear(y);
     } else if (kind === 'chartYM') {
       setChartYear(y);
       setChartMonth(m);
+      setExpandedChartCatId(null);
     } else if (kind === 'chartYear') {
       setChartYear(y);
+      setExpandedChartCatId(null);
     } else if (kind === 'calYM') {
       setCalYear(y);
       setCalMonth(m);
@@ -227,7 +255,7 @@ export default function MobileView({
     });
   };
 
-  const handleSaveEntry = async () => {
+  const handleSaveEntry = async (keepOpen = false) => {
     const cents = evalCalcExpr(entryExpr);
     if (cents <= 0) {
       showToast('请输入大于 0 的金额');
@@ -256,8 +284,14 @@ export default function MobileView({
         ? `已修改：${draft.note || cat.name} ¥${fmtNum(cents)}`
         : `已记一笔：${draft.note || cat.name} ¥${fmtNum(cents)}`,
     );
-    setEditingTxId(null);
-    setScreen('feed');
+
+    if (keepOpen && !editingTxId) {
+      setEntryExpr('');
+      setEntryNote('');
+    } else {
+      setEditingTxId(null);
+      setScreen('feed');
+    }
   };
 
   const getExportList = (scope: 'month' | 'year' | 'all') => {
@@ -327,24 +361,24 @@ export default function MobileView({
                   active ? 'shark-yellow text-[#222222]' : 'text-[#666666]'
                 }`}
               >
-                {it.id === 'feed' && (
+                {tabId === 'feed' && (
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
                     <path d="M4 6h16M4 12h16M4 18h10" />
                   </svg>
                 )}
-                {it.id === 'charts' && (
+                {tabId === 'charts' && (
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
                     <path d="M3 17l6-6 4 4 8-8" />
                     <path d="M14 7h7v7" />
                   </svg>
                 )}
-                {it.id === 'bill' && (
+                {tabId === 'bill' && (
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
                     <rect x="4" y="3" width="16" height="18" rx="2" />
                     <path d="M8 8h8M8 12h8M8 16h5" />
                   </svg>
                 )}
-                {it.id === 'export' && (
+                {tabId === 'export' && (
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
                     <path d="M12 3v12m0 0l-4-4m4 4l4-4" />
                     <path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" />
@@ -361,7 +395,9 @@ export default function MobileView({
     );
   };
 
+  // ============================================
   // 1. FEED SCREEN
+  // ============================================
   if (screen === 'feed') {
     const monthTotals = getMonthTotals(transactions, feedYear, feedMonth, false);
     const prefix = getMonthPrefix(feedYear, feedMonth);
@@ -388,11 +424,30 @@ export default function MobileView({
         <header className="shark-yellow px-4 pt-3 pb-5 sticky top-0 z-20">
           <div className="flex items-center justify-between mb-3">
             <div className="text-[11px] text-[#555555] flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-[#22C55E] inline-block" />
-              <span>{storageMode === 'supabase' ? '云端同步' : '本地存储'}</span>
+              <span
+                className={`w-1.5 h-1.5 rounded-full inline-block ${
+                  syncing ? 'bg-[#F59E0B] animate-pulse' : 'bg-[#22C55E]'
+                }`}
+              />
+              <span>{syncing ? '同步中' : storageMode === 'supabase' ? '云端同步' : '本地存储'}</span>
             </div>
             <div className="text-base font-bold tracking-wide text-[#222222]">简账</div>
-            <div className="flex items-center gap-3 text-[#222222]">
+            <div className="flex items-center gap-2.5 text-[#222222]">
+              <button
+                type="button"
+                onClick={() => {
+                  setContextTxId(null);
+                  setBatchMode((prev) => {
+                    if (prev) setSelectedIds([]);
+                    return !prev;
+                  });
+                }}
+                className={`text-xs px-2 py-0.5 rounded-md font-medium ${
+                  batchMode ? 'bg-[#333333] text-white' : 'bg-black/10 text-[#222222]'
+                }`}
+              >
+                {batchMode ? '完成' : '多选'}
+              </button>
               <button type="button" onClick={() => setSearchOpen((v) => !v)} title="搜索">
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                   <circle cx="11" cy="11" r="7" />
@@ -475,7 +530,7 @@ export default function MobileView({
           </div>
         </header>
 
-        {/* Shortcut Strip */}
+        {/* Shortcut Strip: 账单 | 预算 | 日历 | 固定 */}
         <div className="px-3 -mt-3 mb-2 z-20 relative">
           <div className="bg-white rounded-xl py-2.5 px-2 grid grid-cols-4 gap-1 shadow-sm border border-[#F0F0F0]">
             <button type="button" onClick={() => goScreen('bill')} className="flex flex-col items-center gap-1">
@@ -490,9 +545,9 @@ export default function MobileView({
               <span className="w-7 h-7 rounded-lg shark-yellow-soft flex items-center justify-center text-sm">📅</span>
               <span className="text-xs text-[#444444]">日历</span>
             </button>
-            <button type="button" onClick={() => goScreen('export')} className="flex flex-col items-center gap-1">
-              <span className="w-7 h-7 rounded-lg shark-yellow-soft flex items-center justify-center text-sm">📤</span>
-              <span className="text-xs text-[#444444]">导出</span>
+            <button type="button" onClick={() => goScreen('recurring')} className="flex flex-col items-center gap-1">
+              <span className="w-7 h-7 rounded-lg shark-yellow-soft flex items-center justify-center text-sm">📌</span>
+              <span className="text-xs text-[#444444]">固定</span>
             </button>
           </div>
         </div>
@@ -526,13 +581,38 @@ export default function MobileView({
                     {items.map((tx) => {
                       const cat = getCategory(tx.categoryId);
                       const title = tx.note ? tx.note : cat.name;
+                      const isChecked = selectedIds.includes(tx.id);
+                      const toggleSelect = () => {
+                        setSelectedIds((prev) =>
+                          prev.includes(tx.id) ? prev.filter((id) => id !== tx.id) : [...prev, tx.id],
+                        );
+                      };
                       return (
                         <div
                           key={tx.id}
-                          onClick={() => setContextTxId((prev) => (prev === tx.id ? null : tx.id))}
-                          className="px-4 py-3 flex items-center justify-between border-b border-[#F7F7F7] active:bg-[#FAFAFA] cursor-pointer relative"
+                          onClick={() => {
+                            if (batchMode) {
+                              toggleSelect();
+                            } else {
+                              setContextTxId((prev) => (prev === tx.id ? null : tx.id));
+                            }
+                          }}
+                          className={`px-4 py-3 flex items-center justify-between border-b border-[#F7F7F7] active:bg-[#FAFAFA] cursor-pointer relative ${
+                            batchMode && isChecked ? 'bg-[#FFFDF0]' : ''
+                          }`}
                         >
                           <div className="flex items-center gap-3 min-w-0">
+                            {batchMode && (
+                              <span
+                                className={`w-5 h-5 rounded-full border flex items-center justify-center text-xs shrink-0 transition-colors ${
+                                  isChecked
+                                    ? 'shark-yellow border-[#E5C100] text-[#222222] font-bold'
+                                    : 'border-[#CCCCCC] bg-white'
+                                }`}
+                              >
+                                {isChecked ? '✓' : ''}
+                              </span>
+                            )}
                             <span className="w-8 h-8 rounded-full bg-[#F5F5F5] flex items-center justify-center text-base shrink-0">
                               {cat.icon}
                             </span>
@@ -542,7 +622,7 @@ export default function MobileView({
                             {tx.type === 'income' ? fmtNum(tx.amountCents) : `-${fmtNum(tx.amountCents)}`}
                           </span>
 
-                          {contextTxId === tx.id && (
+                          {!batchMode && contextTxId === tx.id && (
                             <div
                               onClick={(e) => e.stopPropagation()}
                               className="absolute left-12 top-11 z-30 w-40 bg-white rounded-xl shadow-xl border border-[#EAEAEA] py-1 text-xs text-[#222222]"
@@ -556,6 +636,17 @@ export default function MobileView({
                                 className="w-full text-left px-4 py-2.5 hover:bg-[#F7F7F7] text-[#E53935]"
                               >
                                 删除
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setContextTxId(null);
+                                  setBatchMode(true);
+                                  setSelectedIds([tx.id]);
+                                }}
+                                className="w-full text-left px-4 py-2.5 hover:bg-[#F7F7F7]"
+                              >
+                                批量选择
                               </button>
                               <button
                                 type="button"
@@ -612,7 +703,96 @@ export default function MobileView({
           )}
         </div>
 
-        {renderBottomNav()}
+        {batchMode ? (
+          <div className="fixed bottom-0 inset-x-0 z-30 bg-white border-t border-[#EFEFEF] px-4 py-3 safe-pb flex items-center justify-between shadow-lg">
+            <button
+              type="button"
+              onClick={() => {
+                const allIds = list.map((t) => t.id);
+                const allSelected = allIds.length > 0 && allIds.every((id) => selectedIds.includes(id));
+                setSelectedIds(allSelected ? [] : allIds);
+              }}
+              className="flex items-center gap-2 text-xs font-medium text-[#222222]"
+            >
+              <span
+                className={`w-5 h-5 rounded-full border flex items-center justify-center text-xs ${
+                  list.length > 0 && list.every((t) => selectedIds.includes(t.id))
+                    ? 'shark-yellow border-[#E5C100] font-bold'
+                    : 'border-[#CCCCCC] bg-white'
+                }`}
+              >
+                {list.length > 0 && list.every((t) => selectedIds.includes(t.id)) ? '✓' : ''}
+              </span>
+              <span>
+                {list.length > 0 && list.every((t) => selectedIds.includes(t.id)) ? '取消全选' : '全选本月'}
+              </span>
+              <span className="text-[#888888] tabular-nums">({selectedIds.length})</span>
+            </button>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setBatchMode(false);
+                  setSelectedIds([]);
+                }}
+                className="px-3.5 py-2 rounded-xl bg-[#F5F5F5] text-xs font-medium text-[#555555]"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={selectedIds.length === 0 || syncing}
+                onClick={() => setConfirmBatchDeleteOpen(true)}
+                className="px-4 py-2 rounded-xl bg-[#E53935] text-white text-xs font-bold disabled:opacity-40 tabular-nums"
+              >
+                删除 ({selectedIds.length})
+              </button>
+            </div>
+          </div>
+        ) : (
+          renderBottomNav()
+        )}
+
+        {confirmBatchDeleteOpen && (
+          <div
+            className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4"
+            onClick={() => setConfirmBatchDeleteOpen(false)}
+          >
+            <div
+              className="w-full max-w-xs bg-white rounded-2xl p-5 space-y-4 text-center"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="text-sm font-bold text-[#222222]">确认批量删除</div>
+              <div className="text-xs text-[#666666] leading-relaxed">
+                确定删除已选中的 <strong className="text-[#E53935]">{selectedIds.length}</strong> 条账单记录吗？删除后无法恢复。
+              </div>
+              <div className="grid grid-cols-2 gap-2.5 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setConfirmBatchDeleteOpen(false)}
+                  className="py-2.5 rounded-xl bg-[#F5F5F5] font-medium text-[#555555]"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const target = [...selectedIds];
+                    setConfirmBatchDeleteOpen(false);
+                    setSelectedIds([]);
+                    setBatchMode(false);
+                    await onBatchDeleteTx(target);
+                  }}
+                  className="py-2.5 rounded-xl bg-[#E53935] text-white font-bold"
+                >
+                  确认删除
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         <MobilePickerSheet
           request={pickerReq}
           onClose={() => setPickerReq(null)}
@@ -622,7 +802,9 @@ export default function MobileView({
     );
   }
 
-  // 2. CHARTS SCREEN
+  // ============================================
+  // 2. CHARTS SCREEN (With Category Drill-down + Pure Consumption Toggle)
+  // ============================================
   if (screen === 'charts') {
     const activeWeek = recentWeeks[chartWeekIdx] ?? recentWeeks[recentWeeks.length - 1];
     const data = buildRealChartData({
@@ -633,17 +815,16 @@ export default function MobileView({
       year: chartYear,
       month: chartMonth,
       todayStr,
+      skipInvestment: excludeInvestment,
     });
     const maxRank = data.rankList.length ? data.rankList[0].cents : 1;
 
-    // Last 6 months up to todayMonth
     const presetMonths: { y: number; m: number; label: string }[] = [];
     for (let i = 5; i >= 0; i--) {
       const d = new Date(todayYear, todayMonth - 1 - i, 1);
       const y = d.getFullYear();
       const m = d.getMonth() + 1;
-      const label = i === 0 ? '本月' : i === 1 ? '上月' : `${pad2(m)}月`;
-      presetMonths.push({ y, m, label });
+      presetMonths.push({ y, m, label: i === 0 ? '本月' : i === 1 ? '上月' : `${pad2(m)}月` });
     }
     const isCustomMonth = !presetMonths.some((p) => p.y === chartYear && p.m === chartMonth);
 
@@ -664,7 +845,8 @@ export default function MobileView({
     return (
       <div className="min-h-screen bg-white pb-20 flex flex-col relative">
         <header className="shark-yellow px-4 pt-3 pb-3 sticky top-0 z-20">
-          <div className="flex items-center justify-center mb-2.5">
+          <div className="flex items-center justify-between mb-2.5">
+            <div className="w-16" />
             <button
               type="button"
               onClick={() => setChartTypeMenuOpen((v) => !v)}
@@ -672,6 +854,21 @@ export default function MobileView({
             >
               <span>{chartType === 'expense' ? '支出' : '收入'}</span>
               <span className="text-xs">▾</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setExcludeInvestment((v) => !v);
+                setExpandedChartCatId(null);
+              }}
+              className={`w-16 py-0.5 rounded-full text-[11px] font-medium text-center transition-colors ${
+                excludeInvestment
+                  ? 'bg-[#333333] text-white'
+                  : 'bg-black/10 text-[#333333]'
+              }`}
+              title="切换是否排除黄金、基金、理财"
+            >
+              {excludeInvestment ? '纯消费' : '含投资'}
             </button>
           </div>
           <div className="grid grid-cols-3 rounded-lg overflow-hidden border border-[#333333] text-xs font-medium">
@@ -685,7 +882,10 @@ export default function MobileView({
               <button
                 key={k}
                 type="button"
-                onClick={() => setChartScope(k)}
+                onClick={() => {
+                  setChartScope(k);
+                  setExpandedChartCatId(null);
+                }}
                 className={`py-1.5 transition-colors ${
                   chartScope === k ? 'shark-dark' : 'text-[#333333]'
                 }`}
@@ -707,6 +907,7 @@ export default function MobileView({
                 onClick={() => {
                   setChartType('expense');
                   setChartTypeMenuOpen(false);
+                  setExpandedChartCatId(null);
                 }}
                 className="w-full px-5 py-3.5 flex items-center justify-between text-sm"
               >
@@ -720,6 +921,7 @@ export default function MobileView({
                 onClick={() => {
                   setChartType('income');
                   setChartTypeMenuOpen(false);
+                  setExpandedChartCatId(null);
                 }}
                 className="w-full px-5 py-3.5 flex items-center justify-between text-sm"
               >
@@ -739,7 +941,10 @@ export default function MobileView({
               <button
                 key={w.start}
                 type="button"
-                onClick={() => setChartWeekIdx(idx)}
+                onClick={() => {
+                  setChartWeekIdx(idx);
+                  setExpandedChartCatId(null);
+                }}
                 className={`py-2 px-2.5 shrink-0 ${
                   idx === chartWeekIdx
                     ? 'text-[#222222] font-semibold border-b-2 border-[#333333]'
@@ -764,6 +969,7 @@ export default function MobileView({
                     onClick={() => {
                       setChartYear(p.y);
                       setChartMonth(p.m);
+                      setExpandedChartCatId(null);
                     }}
                     className={`py-2 px-2.5 shrink-0 ${
                       active ? 'text-[#222222] font-semibold border-b-2 border-[#333333]' : ''
@@ -795,7 +1001,10 @@ export default function MobileView({
                   <button
                     key={p.y}
                     type="button"
-                    onClick={() => setChartYear(p.y)}
+                    onClick={() => {
+                      setChartYear(p.y);
+                      setExpandedChartCatId(null);
+                    }}
                     className={`py-2 px-2.5 shrink-0 ${
                       active ? 'text-[#222222] font-semibold border-b-2 border-[#333333]' : ''
                     }`}
@@ -821,7 +1030,8 @@ export default function MobileView({
           <div className="px-4 pt-3 pb-2 border-b border-[#F2F2F2]">
             <div className="flex items-center justify-between text-xs text-[#555555]">
               <span>
-                总{chartType === 'expense' ? '支出' : '收入'}:{' '}
+                总{chartType === 'expense' ? '支出' : '收入'}
+                {excludeInvestment ? '（不含黄金/基金/理财）' : ''}:{' '}
                 <span className="tabular-nums font-medium text-[#222222]">
                   {fmtNum(data.total, true)}
                 </span>
@@ -835,34 +1045,83 @@ export default function MobileView({
           </div>
 
           <div className="px-4 py-3">
-            <div className="text-sm font-semibold mb-3">
-              {chartType === 'expense' ? '支出排行榜' : '收入排行榜'}
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-sm font-semibold">
+                {chartType === 'expense' ? '支出排行榜' : '收入排行榜'}
+              </span>
+              <span className="text-[11px] text-[#999999]">点击分类展开明细</span>
             </div>
             {data.rankList.length > 0 ? (
-              <div className="space-y-3.5">
+              <div className="space-y-3">
                 {data.rankList.map((item) => {
                   const barW = Math.max(4, Math.round((item.cents / maxRank) * 100));
+                  const isExpanded = expandedChartCatId === item.cat.id;
+                  const catTxs = isExpanded
+                    ? data.periodTransactions
+                        .filter((t) => t.categoryId === item.cat.id)
+                        .sort((a, b) => b.amountCents - a.amountCents)
+                    : [];
+
                   return (
-                    <div key={item.cat.id} className="flex items-center gap-3">
-                      <span className="w-8 h-8 rounded-full bg-[#F5F5F5] flex items-center justify-center text-base shrink-0">
-                        {item.cat.icon}
-                      </span>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between text-xs mb-1">
-                          <span className="text-[#222222] font-medium">
-                            {item.cat.name}{' '}
-                            <span className="text-[#888888] font-normal ml-1 tabular-nums">
-                              {item.pct.toFixed(1)}%
+                    <div key={item.cat.id} className="rounded-xl overflow-hidden">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setExpandedChartCatId((prev) => (prev === item.cat.id ? null : item.cat.id))
+                        }
+                        className="w-full flex items-center gap-3 py-1 text-left active:opacity-80"
+                      >
+                        <span className="w-8 h-8 rounded-full bg-[#F5F5F5] flex items-center justify-center text-base shrink-0">
+                          {item.cat.icon}
+                        </span>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between text-xs mb-1">
+                            <span className="text-[#222222] font-medium">
+                              {item.cat.name}{' '}
+                              <span className="text-[#888888] font-normal ml-1 tabular-nums">
+                                {item.pct.toFixed(1)}% · {item.count}笔
+                              </span>
                             </span>
-                          </span>
-                          <span className="tabular-nums text-[#222222] font-medium">
-                            {fmtNum(item.cents)}
-                          </span>
+                            <span className="tabular-nums text-[#222222] font-medium flex items-center gap-1">
+                              <span>{fmtNum(item.cents)}</span>
+                              <span className="text-[#AAAAAA] text-[10px]">
+                                {isExpanded ? '▴' : '▾'}
+                              </span>
+                            </span>
+                          </div>
+                          <div className="w-full h-1.5 rounded-full bg-[#F3F3F3] overflow-hidden">
+                            <div
+                              className="h-full rounded-full shark-yellow"
+                              style={{ width: `${barW}%` }}
+                            />
+                          </div>
                         </div>
-                        <div className="w-full h-1.5 rounded-full bg-[#F3F3F3] overflow-hidden">
-                          <div className="h-full rounded-full shark-yellow" style={{ width: `${barW}%` }} />
+                      </button>
+
+                      {isExpanded && catTxs.length > 0 && (
+                        <div className="mt-2 ml-11 bg-[#FAFAFA] rounded-xl border border-[#F0F0F0] divide-y divide-[#EFEFEF]">
+                          {catTxs.map((tx) => (
+                            <div
+                              key={tx.id}
+                              onClick={() => openAdd(tx)}
+                              className="px-3 py-2 flex items-center justify-between gap-2 text-xs active:bg-[#F2F2F2] cursor-pointer"
+                            >
+                              <div className="min-w-0">
+                                <div className="text-[#222222] truncate">
+                                  {tx.note || item.cat.name}
+                                </div>
+                                <div className="text-[11px] text-[#999999] tabular-nums">
+                                  {tx.date}
+                                </div>
+                              </div>
+                              <span className="font-semibold tabular-nums shrink-0 text-[#222222]">
+                                {tx.type === 'income' ? '+' : '-'}
+                                {fmtNum(tx.amountCents)}
+                              </span>
+                            </div>
+                          ))}
                         </div>
-                      </div>
+                      )}
                     </div>
                   );
                 })}
@@ -885,9 +1144,12 @@ export default function MobileView({
     );
   }
 
-  // 3. ADD / EDIT ENTRY SCREEN
+  // ============================================
+  // 3. ADD / EDIT ENTRY SCREEN (With Recent Note Pills + 0ms Optimistic Save)
+  // ============================================
   if (screen === 'add') {
     const activeCats = getCategoriesByType(entryType);
+    const recentNotes = getRecentNotesForCategory(transactions, entryCatId, 6);
     const hasOp = /[+-]/.test(entryExpr);
     const preview = evalCalcExpr(entryExpr);
     const dateLabel =
@@ -900,7 +1162,17 @@ export default function MobileView({
     return (
       <div className="h-dvh bg-white flex flex-col text-[#222222]">
         <header className="shark-yellow px-4 pt-3 pb-2 flex items-center justify-between shrink-0">
-          <div className="w-10" />
+          {!editingTxId ? (
+            <button
+              type="button"
+              onClick={() => handleSaveEntry(true)}
+              className="text-xs font-medium text-[#333333] text-left"
+            >
+              再记一笔
+            </button>
+          ) : (
+            <div className="w-12" />
+          )}
           <div className="flex items-center gap-6 text-sm font-medium">
             <button
               type="button"
@@ -930,7 +1202,7 @@ export default function MobileView({
           <button
             type="button"
             onClick={() => goScreen('feed')}
-            className="text-xs text-[#333333] w-10 text-right"
+            className="text-xs text-[#333333] w-12 text-right"
           >
             取消
           </button>
@@ -964,8 +1236,28 @@ export default function MobileView({
           </div>
         </div>
 
-        {/* Bottom Note + Amount + Calculator Keypad */}
+        {/* Bottom Recent Notes + Note Input + Calculator Keypad */}
         <div className="border-t border-[#ECECEC] bg-[#F7F8FA] p-2.5 safe-pb space-y-2 shrink-0">
+          {recentNotes.length > 0 && (
+            <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar px-0.5">
+              <span className="text-[11px] text-[#999999] shrink-0">常用备注:</span>
+              {recentNotes.map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() => setEntryNote(n)}
+                  className={`px-2.5 py-0.5 rounded-full text-xs shrink-0 border transition-colors ${
+                    entryNote === n
+                      ? 'shark-yellow border-[#E5C100] text-[#222222] font-medium'
+                      : 'bg-white border-[#EAEAEA] text-[#555555]'
+                  }`}
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
+          )}
+
           <div className="bg-white rounded-lg px-3 py-2 flex items-center justify-between gap-2 border border-[#EFEFEF]">
             <input
               type="text"
@@ -1027,11 +1319,10 @@ export default function MobileView({
                     <button
                       key="DONE"
                       type="button"
-                      disabled={syncing}
-                      onClick={handleSaveEntry}
-                      className="h-11 rounded-lg shark-yellow text-xs font-bold text-[#222222] disabled:opacity-50"
+                      onClick={() => handleSaveEntry(false)}
+                      className="h-11 rounded-lg shark-yellow text-xs font-bold text-[#222222] active:opacity-80"
                     >
-                      {syncing ? '保存中' : '完成'}
+                      完成
                     </button>
                   );
                 }
@@ -1059,14 +1350,16 @@ export default function MobileView({
     );
   }
 
-  // 4. BILL SCREEN (Monthly / Yearly, 1949-2100)
+  // ============================================
+  // 4. BILL SCREEN (With Pure Consumption Toggle + 1949-2100 Year Picker)
+  // ============================================
   if (screen === 'bill') {
-    const months = getYearMonthRows(transactions, billYear, false);
+    const months = getYearMonthRows(transactions, billYear, excludeInvestment);
     const yInc = months.reduce((s, m) => s + m.income, 0);
     const yExp = months.reduce((s, m) => s + m.expense, 0);
     const yBal = yInc - yExp;
 
-    const yearsSummary = getAllYearRows(transactions, false);
+    const yearsSummary = getAllYearRows(transactions, excludeInvestment);
     const allInc = yearsSummary.reduce((s, y) => s + y.income, 0);
     const allExp = yearsSummary.reduce((s, y) => s + y.expense, 0);
     const allBal = allInc - allExp;
@@ -1103,7 +1396,16 @@ export default function MobileView({
               年账单
             </button>
           </div>
-          <span className="w-20" />
+
+          <button
+            type="button"
+            onClick={() => setExcludeInvestment((v) => !v)}
+            className={`w-16 py-0.5 rounded-full text-[11px] font-medium text-center ${
+              excludeInvestment ? 'bg-[#333333] text-white' : 'bg-[#F5F5F5] text-[#555555]'
+            }`}
+          >
+            {excludeInvestment ? '纯消费' : '含投资'}
+          </button>
         </header>
 
         <div className="p-3.5">
@@ -1113,6 +1415,7 @@ export default function MobileView({
           >
             <div className="text-xs text-[#555555]">
               {billTab === 'month' ? `${billYear}年结余` : '总结余'}
+              {excludeInvestment ? '（不含黄金/基金/理财）' : ''}
             </div>
             <div className="text-2xl font-bold tabular-nums mt-1 mb-3">
               {fmtNum(billTab === 'month' ? yBal : allBal, true)}
@@ -1214,15 +1517,17 @@ export default function MobileView({
     );
   }
 
+  // ============================================
   // 5. MONTH REPORT SUBPAGE
+  // ============================================
   if (screen === 'monthReport') {
-    const curTotals = getMonthTotals(transactions, billYear, reportMonth, false);
+    const curTotals = getMonthTotals(transactions, billYear, reportMonth, excludeInvestment);
     const prevDate = new Date(billYear, reportMonth - 2, 1);
     const prevTotals = getMonthTotals(
       transactions,
       prevDate.getFullYear(),
       prevDate.getMonth() + 1,
-      false,
+      excludeInvestment,
     );
     const data = buildRealChartData({
       transactions,
@@ -1232,6 +1537,7 @@ export default function MobileView({
       year: billYear,
       month: reportMonth,
       todayStr,
+      skipInvestment: excludeInvestment,
     });
     const top5 = data.rankList.slice(0, 5);
     const otherCents = data.rankList.slice(5).reduce((s, i) => s + i.cents, 0);
@@ -1242,6 +1548,7 @@ export default function MobileView({
             {
               cat: { id: 'other', name: '其它', type: 'expense' as const, icon: '📦', color: '#CBD5E1' },
               cents: otherCents,
+              count: 0,
               pct: curTotals.exp > 0 ? (otherCents / curTotals.exp) * 100 : 0,
             },
           ]
@@ -1256,7 +1563,12 @@ export default function MobileView({
 
     const prefix = getMonthPrefix(billYear, reportMonth);
     const top3Single = transactions
-      .filter((t) => t.type === 'expense' && t.date.startsWith(prefix))
+      .filter(
+        (t) =>
+          t.type === 'expense' &&
+          t.date.startsWith(prefix) &&
+          (!excludeInvestment || !getCategory(t.categoryId).isInvestment),
+      )
       .sort((a, b) => b.amountCents - a.amountCents)
       .slice(0, 3);
 
@@ -1274,7 +1586,14 @@ export default function MobileView({
 
         <div className="p-3 space-y-3">
           <div className="bg-white rounded-2xl p-4 space-y-3">
-            <div className="text-lg font-bold">{reportMonth}月账单</div>
+            <div className="flex items-center justify-between">
+              <span className="text-lg font-bold">{reportMonth}月账单</span>
+              {excludeInvestment && (
+                <span className="text-[11px] px-2 py-0.5 rounded-full bg-[#333333] text-white">
+                  纯消费口径
+                </span>
+              )}
+            </div>
             <div className="grid grid-cols-2 gap-3 pb-3 border-b border-[#F2F2F2]">
               <div>
                 <div className="text-xs text-[#999999]">本月结余:</div>
@@ -1413,12 +1732,14 @@ export default function MobileView({
     );
   }
 
-  // 6. BUDGET SUBPAGE (With top-left back button, NO bottom nav)
+  // ============================================
+  // 6. BUDGET SUBPAGE (Per-Month Override Support + Top-left Back Button)
+  // ============================================
   if (screen === 'budget') {
     const mTotals = getMonthTotals(transactions, feedYear, feedMonth, false);
-    const rem = budget.monthlyCents - mTotals.exp;
-    const remPct =
-      budget.monthlyCents > 0 ? Math.max(0, Math.round((rem / budget.monthlyCents) * 100)) : 0;
+    const { limitCents, isOverride } = getEffectiveMonthlyBudget(budget, feedYear, feedMonth);
+    const rem = limitCents - mTotals.exp;
+    const remPct = limitCents > 0 ? Math.max(0, Math.round((rem / limitCents) * 100)) : 0;
     const r = 36;
     const cx = 44;
     const cy = 44;
@@ -1437,11 +1758,14 @@ export default function MobileView({
           >
             ←
           </button>
-          <div className="text-sm font-bold">月预算</div>
+          <div className="text-sm font-bold">
+            {feedYear}年{feedMonth}月预算
+          </div>
           <button
             type="button"
             onClick={() => {
-              setBudgetInput((budget.monthlyCents / 100).toFixed(2));
+              setBudgetInput((limitCents / 100).toFixed(2));
+              setBudgetApplyMode(isOverride ? 'month' : 'default');
               setBudgetModalOpen(true);
             }}
             className="text-xs font-medium text-[#222222] w-10 text-right"
@@ -1453,17 +1777,40 @@ export default function MobileView({
         <div className="p-3 space-y-3">
           <div className="bg-white rounded-2xl p-4">
             <div className="flex items-center justify-between mb-3">
-              <span className="text-sm font-semibold">{feedMonth}月总预算</span>
-              <button
-                type="button"
-                onClick={() => {
-                  setBudgetInput((budget.monthlyCents / 100).toFixed(2));
-                  setBudgetModalOpen(true);
-                }}
-                className="text-xs text-[#888888]"
-              >
-                修改预算
-              </button>
+              <div className="flex items-center gap-1.5">
+                <span className="text-sm font-semibold">{feedMonth}月总预算</span>
+                {isOverride && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded shark-yellow-soft text-[#666666]">
+                    本月专属
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2 text-xs">
+                {isOverride && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const nextOverrides = { ...budget.monthlyOverrides };
+                      delete nextOverrides[prefix];
+                      onSaveBudget({ ...budget, monthlyOverrides: nextOverrides });
+                    }}
+                    className="text-[#888888] underline"
+                  >
+                    恢复默认
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBudgetInput((limitCents / 100).toFixed(2));
+                    setBudgetApplyMode('month');
+                    setBudgetModalOpen(true);
+                  }}
+                  className="text-[#555555] font-medium"
+                >
+                  修改预算
+                </button>
+              </div>
             </div>
             <div className="flex items-center gap-5">
               <div className="relative shrink-0">
@@ -1495,7 +1842,7 @@ export default function MobileView({
                 </div>
                 <div className="flex justify-between text-[#888888]">
                   <span>本月预算:</span>
-                  <span>{fmtNum(budget.monthlyCents, true)}</span>
+                  <span>{fmtNum(limitCents, true)}</span>
                 </div>
                 <div className="flex justify-between text-[#888888]">
                   <span>本月支出:</span>
@@ -1563,7 +1910,7 @@ export default function MobileView({
           </div>
         </div>
 
-        {/* Edit Monthly Budget Dialog */}
+        {/* Edit Monthly Budget Dialog (Per-month vs Global Default) */}
         {budgetModalOpen && (
           <div
             className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4"
@@ -1573,7 +1920,31 @@ export default function MobileView({
               className="w-full max-w-xs bg-white rounded-2xl p-4 space-y-3"
               onClick={(e) => e.stopPropagation()}
             >
-              <div className="text-sm font-bold">修改月度总预算（元）</div>
+              <div className="text-sm font-bold">修改月度预算（元）</div>
+              <div className="grid grid-cols-2 gap-1.5 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setBudgetApplyMode('month')}
+                  className={`py-1.5 rounded-lg border font-medium ${
+                    budgetApplyMode === 'month'
+                      ? 'shark-yellow border-[#E5C100] font-bold'
+                      : 'bg-[#FAFAFA] border-[#EAEAEA] text-[#666666]'
+                  }`}
+                >
+                  仅 {feedYear}年{feedMonth}月
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBudgetApplyMode('default')}
+                  className={`py-1.5 rounded-lg border font-medium ${
+                    budgetApplyMode === 'default'
+                      ? 'shark-yellow border-[#E5C100] font-bold'
+                      : 'bg-[#FAFAFA] border-[#EAEAEA] text-[#666666]'
+                  }`}
+                >
+                  每月默认预算
+                </button>
+              </div>
               <input
                 type="number"
                 step="0.01"
@@ -1594,7 +1965,15 @@ export default function MobileView({
                   onClick={async () => {
                     const n = parseFloat(budgetInput);
                     if (!Number.isNaN(n) && n >= 0) {
-                      await onSaveBudget({ ...budget, monthlyCents: Math.round(n * 100) });
+                      const cents = Math.round(n * 100);
+                      if (budgetApplyMode === 'month') {
+                        await onSaveBudget({
+                          ...budget,
+                          monthlyOverrides: { ...budget.monthlyOverrides, [prefix]: cents },
+                        });
+                      } else {
+                        await onSaveBudget({ ...budget, monthlyCents: cents });
+                      }
                       setBudgetModalOpen(false);
                     }
                   }}
@@ -1669,7 +2048,212 @@ export default function MobileView({
     );
   }
 
-  // 7. SINGLE TRANSACTION RANKING SUBPAGE
+  // ============================================
+  // 7. RECURRING MONTHLY TEMPLATES SUBPAGE (One-click generate)
+  // ============================================
+  if (screen === 'recurring') {
+    const templates = budget.recurringTemplates || [];
+    const maxD = daysInMonth(feedYear, feedMonth);
+
+    const handleAddTemplate = async (e: React.FormEvent) => {
+      e.preventDefault();
+      const n = parseFloat(recAmount);
+      if (Number.isNaN(n) || n <= 0) {
+        showToast('请输入大于 0 的金额');
+        return;
+      }
+      const nextItem: RecurringTemplate = {
+        id: `tpl_${Date.now()}`,
+        type: recType,
+        categoryId: recCatId,
+        amountCents: Math.round(n * 100),
+        note: recNote.trim(),
+        dayOfMonth: Math.min(28, Math.max(1, Number(recDay) || 1)),
+      };
+      await onSaveBudget({
+        ...budget,
+        recurringTemplates: [...templates, nextItem],
+      });
+      setRecAmount('');
+      setRecNote('');
+      setRecAddOpen(false);
+    };
+
+    const handleApplyTemplates = async () => {
+      if (templates.length === 0) return;
+      const drafts: TxDraft[] = templates.map((tpl) => {
+        const d = Math.min(tpl.dayOfMonth, maxD);
+        return {
+          type: tpl.type,
+          categoryId: tpl.categoryId,
+          amountCents: tpl.amountCents,
+          date: `${feedYear}-${pad2(feedMonth)}-${pad2(d)}`,
+          note: tpl.note || getCategory(tpl.categoryId).name,
+        };
+      });
+      await onImportTx(drafts, true);
+    };
+
+    return (
+      <div className="min-h-screen bg-[#F7F8FA] text-[#222222] flex flex-col">
+        <header className="shark-yellow px-4 py-3 flex items-center justify-between sticky top-0 z-20">
+          <button
+            type="button"
+            onClick={() => goScreen('feed')}
+            className="text-base font-semibold text-[#222222] w-10 text-left"
+          >
+            ←
+          </button>
+          <div className="text-sm font-bold">固定月账单</div>
+          <button
+            type="button"
+            onClick={() => setRecAddOpen((v) => !v)}
+            className="text-xs font-semibold text-[#222222] w-10 text-right"
+          >
+            {recAddOpen ? '收起' : '+ 新增'}
+          </button>
+        </header>
+
+        <div className="p-3.5 space-y-3">
+          {recAddOpen && (
+            <form
+              onSubmit={handleAddTemplate}
+              className="bg-white rounded-2xl p-4 space-y-2.5 border border-[#FFDA44]"
+            >
+              <div className="text-xs font-bold">新增固定月账单模板</div>
+              <div className="grid grid-cols-2 gap-2">
+                <select
+                  value={recType}
+                  onChange={(e) => {
+                    const t = e.target.value as TxType;
+                    setRecType(t);
+                    setRecCatId(getCategoriesByType(t)[0].id);
+                  }}
+                  className="border border-[#E5E5E5] rounded-lg px-2.5 py-2 text-xs"
+                >
+                  <option value="expense">支出</option>
+                  <option value="income">收入</option>
+                </select>
+                <select
+                  value={recCatId}
+                  onChange={(e) => setRecCatId(e.target.value)}
+                  className="border border-[#E5E5E5] rounded-lg px-2.5 py-2 text-xs"
+                >
+                  {getCategoriesByType(recType).map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.icon} {c.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <input
+                  type="number"
+                  step="0.01"
+                  required
+                  value={recAmount}
+                  onChange={(e) => setRecAmount(e.target.value)}
+                  placeholder="金额（元）"
+                  className="border border-[#E5E5E5] rounded-lg px-2.5 py-2 text-xs tabular-nums"
+                />
+                <input
+                  type="number"
+                  min="1"
+                  max="28"
+                  value={recDay}
+                  onChange={(e) => setRecDay(e.target.value)}
+                  placeholder="每月几号 (1-28)"
+                  className="border border-[#E5E5E5] rounded-lg px-2.5 py-2 text-xs tabular-nums"
+                />
+              </div>
+              <input
+                type="text"
+                value={recNote}
+                onChange={(e) => setRecNote(e.target.value)}
+                placeholder="备注（如：房租、话费月租、黄金定投）"
+                className="w-full border border-[#E5E5E5] rounded-lg px-2.5 py-2 text-xs"
+              />
+              <button
+                type="submit"
+                className="w-full py-2.5 rounded-xl shark-yellow text-xs font-bold text-[#222222]"
+              >
+                保存模板
+              </button>
+            </form>
+          )}
+
+          <div className="bg-white rounded-2xl overflow-hidden border border-[#F0F0F0]">
+            <div className="px-4 py-2.5 border-b border-[#F2F2F2] flex items-center justify-between text-xs">
+              <span className="font-semibold text-[#333333]">已设模板（{templates.length} 项）</span>
+              <span className="text-[#888888]">自动去重，不会重复入账</span>
+            </div>
+            {templates.length > 0 ? (
+              <div className="divide-y divide-[#F5F5F5]">
+                {templates.map((tpl) => {
+                  const cat = getCategory(tpl.categoryId);
+                  return (
+                    <div key={tpl.id} className="px-4 py-3 flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <span className="w-8 h-8 rounded-full bg-[#F5F5F5] flex items-center justify-center text-base shrink-0">
+                          {cat.icon}
+                        </span>
+                        <div className="min-w-0">
+                          <div className="text-xs font-semibold truncate">
+                            {tpl.note || cat.name}
+                          </div>
+                          <div className="text-[11px] text-[#999999]">
+                            每月 {tpl.dayOfMonth} 日 · {cat.name}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-3 shrink-0">
+                        <span className="text-sm font-semibold tabular-nums">
+                          {tpl.type === 'income' ? '+' : '-'}
+                          {fmtNum(tpl.amountCents)}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onSaveBudget({
+                              ...budget,
+                              recurringTemplates: templates.filter((t) => t.id !== tpl.id),
+                            })
+                          }
+                          className="text-xs text-[#E53935]"
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="py-10 text-center text-xs text-[#AAAAAA] space-y-2">
+                <div>还没有固定账单模板</div>
+                <div>适合添加房租、话费、水电、黄金/基金定投</div>
+              </div>
+            )}
+          </div>
+
+          {templates.length > 0 && (
+            <button
+              type="button"
+              disabled={syncing}
+              onClick={handleApplyTemplates}
+              className="w-full py-3 rounded-xl shark-yellow text-sm font-bold text-[#222222] shadow-sm disabled:opacity-50"
+            >
+              一键生成 {feedYear}年{feedMonth}月 全部固定账单
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ============================================
+  // 8. SINGLE TRANSACTION RANKING SUBPAGE
+  // ============================================
   if (screen === 'singleRank') {
     const prefix = getMonthPrefix(feedYear, feedMonth);
     const list = transactions
@@ -1734,7 +2318,11 @@ export default function MobileView({
               const pct = total > 0 ? ((tx.amountCents / total) * 100).toFixed(1) : '0.0';
               const w = Math.max(4, Math.round((tx.amountCents / maxAmt) * 100));
               return (
-                <div key={tx.id} className="flex items-center gap-3">
+                <div
+                  key={tx.id}
+                  onClick={() => openAdd(tx)}
+                  className="flex items-center gap-3 cursor-pointer active:opacity-75"
+                >
                   <span className="w-8 h-8 rounded-full bg-[#F5F5F5] flex items-center justify-center text-base shrink-0">
                     {cat.icon}
                   </span>
@@ -1766,11 +2354,14 @@ export default function MobileView({
     );
   }
 
-  // 8. CALENDAR SUBPAGE
+  // ============================================
+  // 9. CALENDAR SUBPAGE (Uses Per-Month Budget)
+  // ============================================
   if (screen === 'calendar') {
     const totalDays = daysInMonth(calYear, calMonth);
     const firstWeekday = new Date(calYear, calMonth - 1, 1).getDay();
-    const dailyBudget = Math.round(budget.monthlyCents / totalDays);
+    const { limitCents } = getEffectiveMonthlyBudget(budget, calYear, calMonth);
+    const dailyBudget = Math.round(limitCents / totalDays);
 
     const dayMap = new Map<string, { exp: number; inc: number }>();
     for (const tx of transactions) {
@@ -1935,7 +2526,9 @@ export default function MobileView({
     );
   }
 
-  // 9. EXPORT / IMPORT SCREEN (5 columns: 时间、支出/收入、用途、金额、备注)
+  // ============================================
+  // 10. EXPORT / IMPORT SCREEN (5 Columns + WeChat / Alipay Auto-Import)
+  // ============================================
   const exportList = getExportList(exportScope);
 
   const handleMobileFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -2104,7 +2697,7 @@ export default function MobileView({
               </button>
             </div>
             <p className="text-xs text-[#888888] leading-relaxed">
-              支持导入本系统导出的 CSV（时间 / 支出或收入 / 用途 / 金额 / 备注），兼容 UTF-8 与 Excel GBK 编码。
+              自动识别：<strong>简账 5 列 CSV</strong>、<strong>微信支付官方账单</strong>、<strong>支付宝官方账单</strong>（自动过滤信用卡还款/提现/零钱通等内部流转并智能归类）。
             </p>
 
             <label className="block w-full py-5 px-4 rounded-xl border-2 border-dashed border-[#E5E5E5] bg-[#FAFAFA] text-center cursor-pointer active:bg-[#FFF8D6]">
@@ -2132,12 +2725,14 @@ export default function MobileView({
 
           {importPreview && (
             <div className="bg-white rounded-2xl overflow-hidden border border-[#F0F0F0]">
-              <div className="px-3.5 py-2.5 border-b border-[#F2F2F2] flex items-center justify-between text-xs">
+              <div className="px-3.5 py-2.5 border-b border-[#F2F2F2] flex flex-wrap items-center justify-between gap-1 text-xs">
                 <span className="font-semibold text-[#333333]">
-                  解析结果：有效 {importPreview.items.length} 条
+                  识别为【{importPreview.sourceName}】· 有效 {importPreview.items.length} 条
                 </span>
-                {importPreview.skippedRows > 0 && (
-                  <span className="text-[#E53935]">跳过异常 {importPreview.skippedRows} 行</span>
+                {importPreview.filteredTransfers > 0 && (
+                  <span className="text-[#888888]">
+                    已过滤还款/内部流转 {importPreview.filteredTransfers} 条
+                  </span>
                 )}
               </div>
 

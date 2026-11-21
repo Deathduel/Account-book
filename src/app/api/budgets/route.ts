@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
 import { getSnapshot, saveBudget } from '@/lib/storage';
+import type { BudgetSettings, RecurringTemplate } from '@/lib/types';
 
 export async function GET() {
   if (!(await isAuthenticated())) {
@@ -22,19 +23,18 @@ export async function PUT(req: Request) {
     return NextResponse.json({ error: '未登录' }, { status: 401 });
   }
   try {
-    const body = (await req.json()) as {
-      monthlyCents?: number;
-      categories?: Record<string, number>;
+    const body = (await req.json()) as Partial<BudgetSettings>;
+    const payload: BudgetSettings = {
+      monthlyCents: Math.max(0, Math.round(Number(body.monthlyCents ?? 0))),
+      monthlyOverrides: body.monthlyOverrides && typeof body.monthlyOverrides === 'object'
+        ? body.monthlyOverrides
+        : {},
+      categories: body.categories && typeof body.categories === 'object' ? body.categories : {},
+      recurringTemplates: Array.isArray(body.recurringTemplates)
+        ? (body.recurringTemplates as RecurringTemplate[])
+        : [],
     };
-    const monthlyCents = Math.max(0, Math.round(Number(body.monthlyCents ?? 0)));
-    const categories: Record<string, number> = {};
-    if (body.categories && typeof body.categories === 'object') {
-      for (const [k, v] of Object.entries(body.categories)) {
-        const n = Math.round(Number(v));
-        if (Number.isFinite(n) && n > 0) categories[k] = n;
-      }
-    }
-    const saved = await saveBudget({ monthlyCents, categories });
+    const saved = await saveBudget(payload);
     return NextResponse.json({ budget: saved });
   } catch (err) {
     return NextResponse.json(

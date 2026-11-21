@@ -1,7 +1,13 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import type { BudgetSettings, StorageSnapshot, Transaction, TxType } from './types';
+import type {
+  BudgetSettings,
+  RecurringTemplate,
+  StorageSnapshot,
+  Transaction,
+  TxType,
+} from './types';
 
 interface LocalStoreFile {
   nextId: number;
@@ -11,7 +17,9 @@ interface LocalStoreFile {
 
 const DEFAULT_BUDGET: BudgetSettings = {
   monthlyCents: 200000,
+  monthlyOverrides: {},
   categories: {},
+  recurringTemplates: [],
 };
 
 const DATA_DIR = path.join(process.cwd(), 'data');
@@ -28,16 +36,92 @@ export function getStorageMode(): 'supabase' | 'local' {
   return getSupabaseClient() ? 'supabase' : 'local';
 }
 
+function unpackBudgetRow(
+  monthlyCentsRaw: unknown,
+  rawJson: unknown,
+  directOverrides?: unknown,
+  directTemplates?: unknown,
+): BudgetSettings {
+  const monthlyCents = Math.max(0, Math.round(Number(monthlyCentsRaw ?? 200000)));
+  const obj =
+    rawJson && typeof rawJson === 'object' && !Array.isArray(rawJson)
+      ? (rawJson as Record<string, unknown>)
+      : {};
+
+  const categories: Record<string, number> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (k.startsWith('__')) continue;
+    const n = Math.round(Number(v));
+    if (Number.isFinite(n) && n > 0) categories[k] = n;
+  }
+
+  const rawOverrides =
+    directOverrides && typeof directOverrides === 'object'
+      ? directOverrides
+      : obj.__monthlyOverrides;
+  const monthlyOverrides: Record<string, number> = {};
+  if (rawOverrides && typeof rawOverrides === 'object' && !Array.isArray(rawOverrides)) {
+    for (const [k, v] of Object.entries(rawOverrides as Record<string, unknown>)) {
+      if (/^\d{4}-\d{2}$/.test(k)) {
+        const n = Math.round(Number(v));
+        if (Number.isFinite(n) && n >= 0) monthlyOverrides[k] = n;
+      }
+    }
+  }
+
+  const rawTemplates = Array.isArray(directTemplates)
+    ? directTemplates
+    : Array.isArray(obj.__recurringTemplates)
+    ? obj.__recurringTemplates
+    : [];
+  const recurringTemplates: RecurringTemplate[] = [];
+  for (const item of rawTemplates) {
+    if (!item || typeof item !== 'object') continue;
+    const r = item as Partial<RecurringTemplate>;
+    const amt = Math.round(Number(r.amountCents ?? 0));
+    const day = Math.min(28, Math.max(1, Math.round(Number(r.dayOfMonth ?? 1))));
+    if (
+      r.id &&
+      (r.type === 'expense' || r.type === 'income') &&
+      r.categoryId &&
+      Number.isFinite(amt) &&
+      amt > 0
+    ) {
+      recurringTemplates.push({
+        id: String(r.id),
+        type: r.type,
+        categoryId: String(r.categoryId),
+        amountCents: amt,
+        note: String(r.note || '').trim().slice(0, 100),
+        dayOfMonth: day,
+      });
+    }
+  }
+
+  return { monthlyCents, monthlyOverrides, categories, recurringTemplates };
+}
+
+function packBudgetJson(budget: BudgetSettings): Record<string, unknown> {
+  return {
+    ...budget.categories,
+    __monthlyOverrides: budget.monthlyOverrides,
+    __recurringTemplates: budget.recurringTemplates,
+  };
+}
+
 async function readLocalStore(): Promise<LocalStoreFile> {
   try {
     const raw = await fs.readFile(DATA_FILE, 'utf-8');
     const parsed = JSON.parse(raw) as Partial<LocalStoreFile>;
     const txs = Array.isArray(parsed.transactions) ? parsed.transactions : [];
     const maxId = txs.reduce((m, t) => Math.max(m, t.id || 0), 0);
+    const b = parsed.budget;
     return {
       nextId: Math.max(parsed.nextId || 1, maxId + 1),
       transactions: txs,
-      budget: parsed.budget ?? { ...DEFAULT_BUDGET },
+      budget: b
+        ? unpackBudgetRow(b.monthlyCents, b.categories, b.monthlyOverrides, b.recurringTemplates)
+        : { ...DEFAULT_BUDGET },
     };
   } catch {
     return {
@@ -55,37 +139,62 @@ async function writeLocalStore(data: LocalStoreFile): Promise<void> {
   await fs.rename(tmpFile, DATA_FILE);
 }
 
+export async function pingStorage(): Promise<{ storageMode: 'supabase' | 'local'; dbOk: boolean }> {
+  const sb = getSupabaseClient();
+  if (sb) {
+    const { error } = await sb.from('budgets').select('id').limit(1);
+    if (error) throw new Error(`Supabase ping error: ${error.message}`);
+    return { storageMode: 'supabase', dbOk: true };
+  }
+  await readLocalStore();
+  return { storageMode: 'local', dbOk: true };
+}
+
+const SUPABASE_PAGE_SIZE = 1000;
+const SUPABASE_MAX_PAGES = 200; // up to 200,000 transactions
+
+async function fetchAllSupabaseTransactions(sb: SupabaseClient): Promise<Transaction[]> {
+  const all: Transaction[] = [];
+  for (let page = 0; page < SUPABASE_MAX_PAGES; page++) {
+    const from = page * SUPABASE_PAGE_SIZE;
+    const to = from + SUPABASE_PAGE_SIZE - 1;
+    const { data, error } = await sb
+      .from('transactions')
+      .select('id, type, amount_cents, category_id, occurred_on, note, created_at')
+      .order('occurred_on', { ascending: false })
+      .order('id', { ascending: false })
+      .range(from, to);
+
+    if (error) throw new Error(`Supabase transactions error: ${error.message}`);
+    const rows = data || [];
+    for (const row of rows) {
+      all.push({
+        id: Number(row.id),
+        type: row.type as TxType,
+        amountCents: Number(row.amount_cents),
+        categoryId: String(row.category_id),
+        date: String(row.occurred_on).slice(0, 10),
+        note: String(row.note || ''),
+        createdAt: row.created_at ? String(row.created_at) : undefined,
+      });
+    }
+    if (rows.length < SUPABASE_PAGE_SIZE) break;
+  }
+  return all;
+}
+
 export async function getSnapshot(): Promise<StorageSnapshot> {
   const sb = getSupabaseClient();
   if (sb) {
-    const [txRes, budgetRes] = await Promise.all([
-      sb
-        .from('transactions')
-        .select('id, type, amount_cents, category_id, occurred_on, note, created_at')
-        .order('occurred_on', { ascending: false })
-        .order('id', { ascending: false })
-        .limit(10000),
+    const [transactions, budgetRes] = await Promise.all([
+      fetchAllSupabaseTransactions(sb),
       sb.from('budgets').select('monthly_cents, categories').eq('id', 'default').maybeSingle(),
     ]);
 
-    if (txRes.error) throw new Error(`Supabase transactions error: ${txRes.error.message}`);
     if (budgetRes.error) throw new Error(`Supabase budgets error: ${budgetRes.error.message}`);
 
-    const transactions: Transaction[] = (txRes.data || []).map((row) => ({
-      id: Number(row.id),
-      type: row.type as TxType,
-      amountCents: Number(row.amount_cents),
-      categoryId: String(row.category_id),
-      date: String(row.occurred_on).slice(0, 10),
-      note: String(row.note || ''),
-      createdAt: row.created_at ? String(row.created_at) : undefined,
-    }));
-
-    const budget: BudgetSettings = budgetRes.data
-      ? {
-          monthlyCents: Number(budgetRes.data.monthly_cents ?? 200000),
-          categories: (budgetRes.data.categories as Record<string, number>) || {},
-        }
+    const budget = budgetRes.data
+      ? unpackBudgetRow(budgetRes.data.monthly_cents, budgetRes.data.categories)
       : { ...DEFAULT_BUDGET };
 
     return { transactions, budget, storageMode: 'supabase' };
@@ -205,6 +314,30 @@ export async function deleteTransaction(id: number): Promise<boolean> {
   return true;
 }
 
+export async function deleteTransactionsBatch(ids: number[]): Promise<number> {
+  const uniqueIds = Array.from(new Set(ids.filter((id) => Number.isInteger(id) && id > 0)));
+  if (uniqueIds.length === 0) return 0;
+
+  const sb = getSupabaseClient();
+  if (sb) {
+    const CHUNK_SIZE = 500;
+    for (let i = 0; i < uniqueIds.length; i += CHUNK_SIZE) {
+      const chunk = uniqueIds.slice(i, i + CHUNK_SIZE);
+      const { error } = await sb.from('transactions').delete().in('id', chunk);
+      if (error) throw new Error(`Supabase batch delete error: ${error.message}`);
+    }
+    return uniqueIds.length;
+  }
+
+  const local = await readLocalStore();
+  const idSet = new Set(uniqueIds);
+  const before = local.transactions.length;
+  local.transactions = local.transactions.filter((t) => !idSet.has(t.id));
+  const deleted = before - local.transactions.length;
+  if (deleted > 0) await writeLocalStore(local);
+  return deleted;
+}
+
 function makeDedupKey(t: {
   date: string;
   type: TxType;
@@ -242,30 +375,36 @@ export async function importTransactions(
 
   const sb = getSupabaseClient();
   if (sb) {
-    const payload = toInsert.map((item) => ({
-      type: item.type,
-      amount_cents: item.amountCents,
-      category_id: item.categoryId,
-      occurred_on: item.date,
-      note: item.note,
-    }));
+    const CHUNK_SIZE = 500;
+    const imported: Transaction[] = [];
+    for (let i = 0; i < toInsert.length; i += CHUNK_SIZE) {
+      const chunk = toInsert.slice(i, i + CHUNK_SIZE).map((item) => ({
+        type: item.type,
+        amount_cents: item.amountCents,
+        category_id: item.categoryId,
+        occurred_on: item.date,
+        note: item.note,
+      }));
 
-    const { data, error } = await sb
-      .from('transactions')
-      .insert(payload)
-      .select('id, type, amount_cents, category_id, occurred_on, note, created_at');
+      const { data, error } = await sb
+        .from('transactions')
+        .insert(chunk)
+        .select('id, type, amount_cents, category_id, occurred_on, note, created_at');
 
-    if (error) throw new Error(`Supabase batch insert error: ${error.message}`);
+      if (error) throw new Error(`Supabase batch insert error: ${error.message}`);
 
-    const imported: Transaction[] = (data || []).map((row) => ({
-      id: Number(row.id),
-      type: row.type as TxType,
-      amountCents: Number(row.amount_cents),
-      categoryId: String(row.category_id),
-      date: String(row.occurred_on).slice(0, 10),
-      note: String(row.note || ''),
-      createdAt: row.created_at ? String(row.created_at) : undefined,
-    }));
+      for (const row of data || []) {
+        imported.push({
+          id: Number(row.id),
+          type: row.type as TxType,
+          amountCents: Number(row.amount_cents),
+          categoryId: String(row.category_id),
+          date: String(row.occurred_on).slice(0, 10),
+          note: String(row.note || ''),
+          createdAt: row.created_at ? String(row.created_at) : undefined,
+        });
+      }
+    }
 
     return { imported, skippedDuplicates };
   }
@@ -287,10 +426,12 @@ export async function importTransactions(
 }
 
 export async function saveBudget(budget: BudgetSettings): Promise<BudgetSettings> {
-  const clean: BudgetSettings = {
-    monthlyCents: Math.max(0, Math.round(budget.monthlyCents)),
-    categories: budget.categories || {},
-  };
+  const clean = unpackBudgetRow(
+    budget.monthlyCents,
+    budget.categories,
+    budget.monthlyOverrides,
+    budget.recurringTemplates,
+  );
 
   const sb = getSupabaseClient();
   if (sb) {
@@ -298,7 +439,7 @@ export async function saveBudget(budget: BudgetSettings): Promise<BudgetSettings
       {
         id: 'default',
         monthly_cents: clean.monthlyCents,
-        categories: clean.categories,
+        categories: packBudgetJson(clean),
         updated_at: new Date().toISOString(),
       },
       { onConflict: 'id' },

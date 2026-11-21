@@ -1,12 +1,13 @@
 import { getCategory } from './categories';
 import { addDays, daysInMonth, getMonthPrefix, pad2, type WeekOption } from './format';
-import type { Category, Transaction, TxType } from './types';
+import type { BudgetSettings, Category, Transaction, TxType } from './types';
 import type { ChartPoint } from '@/components/SharkLineChart';
 
 export interface RankItem {
   cat: Category;
   cents: number;
   pct: number;
+  count: number;
 }
 
 export interface ChartSummary {
@@ -14,6 +15,7 @@ export interface ChartSummary {
   total: number;
   avg: number;
   rankList: RankItem[];
+  periodTransactions: Transaction[];
 }
 
 export interface MonthRow {
@@ -26,6 +28,36 @@ export interface YearRow {
   year: number;
   income: number;
   expense: number;
+}
+
+export function getEffectiveMonthlyBudget(
+  budget: BudgetSettings,
+  year: number,
+  month: number,
+): { limitCents: number; isOverride: boolean } {
+  const key = getMonthPrefix(year, month);
+  if (budget.monthlyOverrides && Object.prototype.hasOwnProperty.call(budget.monthlyOverrides, key)) {
+    return { limitCents: budget.monthlyOverrides[key], isOverride: true };
+  }
+  return { limitCents: budget.monthlyCents, isOverride: false };
+}
+
+export function getRecentNotesForCategory(
+  transactions: Transaction[],
+  categoryId: string,
+  limit = 6,
+): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const tx of transactions) {
+    if (tx.categoryId !== categoryId) continue;
+    const note = tx.note.trim();
+    if (!note || seen.has(note)) continue;
+    seen.add(note);
+    result.push(note);
+    if (result.length >= limit) break;
+  }
+  return result;
 }
 
 export function getMonthTotals(
@@ -104,10 +136,11 @@ export function buildRealChartData(params: {
     (t) => t.type === type && (!skipInvestment || !getCategory(t.categoryId).isInvestment),
   );
 
-  const byCat = new Map<string, number>();
+  const byCat = new Map<string, { cents: number; count: number }>();
   let points: ChartPoint[] = [];
   let total = 0;
   let avg = 0;
+  let periodTransactions: Transaction[] = [];
 
   if (scope === 'week') {
     const days = Array.from({ length: 7 }, (_, i) => addDays(weekOption.start, i));
@@ -116,20 +149,26 @@ export function buildRealChartData(params: {
       const sum = filtered.filter((t) => t.date === d).reduce((s, t) => s + t.amountCents, 0);
       return { label: d.slice(5), value: sum, showTick: true };
     });
-    const inWeek = filtered.filter((t) => daySet.has(t.date));
-    total = inWeek.reduce((s, t) => s + t.amountCents, 0);
+    periodTransactions = filtered.filter((t) => daySet.has(t.date));
+    total = periodTransactions.reduce((s, t) => s + t.amountCents, 0);
     avg = Math.round(total / 7);
-    for (const tx of inWeek) {
-      byCat.set(tx.categoryId, (byCat.get(tx.categoryId) ?? 0) + tx.amountCents);
+    for (const tx of periodTransactions) {
+      const cur = byCat.get(tx.categoryId) ?? { cents: 0, count: 0 };
+      cur.cents += tx.amountCents;
+      cur.count += 1;
+      byCat.set(tx.categoryId, cur);
     }
   } else if (scope === 'month') {
     const totalDays = daysInMonth(year, month);
     const prefix = getMonthPrefix(year, month);
-    const inMonth = filtered.filter((t) => t.date.startsWith(prefix));
+    periodTransactions = filtered.filter((t) => t.date.startsWith(prefix));
     const daySums = new Map<string, number>();
-    for (const tx of inMonth) {
+    for (const tx of periodTransactions) {
       daySums.set(tx.date, (daySums.get(tx.date) ?? 0) + tx.amountCents);
-      byCat.set(tx.categoryId, (byCat.get(tx.categoryId) ?? 0) + tx.amountCents);
+      const cur = byCat.get(tx.categoryId) ?? { cents: 0, count: 0 };
+      cur.cents += tx.amountCents;
+      cur.count += 1;
+      byCat.set(tx.categoryId, cur);
     }
     for (let d = 1; d <= totalDays; d++) {
       const ds = `${prefix}-${pad2(d)}`;
@@ -139,35 +178,39 @@ export function buildRealChartData(params: {
         showTick: [1, 5, 10, 15, 20, 25, totalDays].includes(d),
       });
     }
-    total = inMonth.reduce((s, t) => s + t.amountCents, 0);
+    total = periodTransactions.reduce((s, t) => s + t.amountCents, 0);
     const isCurrentMonth = todayStr.startsWith(prefix);
     const denom = isCurrentMonth ? Math.max(1, Number(todayStr.slice(8, 10))) : totalDays;
     avg = Math.round(total / denom);
   } else {
     const prefix = `${year}-`;
-    const inYear = filtered.filter((t) => t.date.startsWith(prefix));
+    periodTransactions = filtered.filter((t) => t.date.startsWith(prefix));
     const monthSums = new Map<number, number>();
-    for (const tx of inYear) {
+    for (const tx of periodTransactions) {
       const m = Number(tx.date.slice(5, 7));
       monthSums.set(m, (monthSums.get(m) ?? 0) + tx.amountCents);
-      byCat.set(tx.categoryId, (byCat.get(tx.categoryId) ?? 0) + tx.amountCents);
+      const cur = byCat.get(tx.categoryId) ?? { cents: 0, count: 0 };
+      cur.cents += tx.amountCents;
+      cur.count += 1;
+      byCat.set(tx.categoryId, cur);
     }
     for (let m = 1; m <= 12; m++) {
       points.push({ label: `${m}月`, value: monthSums.get(m) ?? 0, showTick: true });
     }
-    total = inYear.reduce((s, t) => s + t.amountCents, 0);
+    total = periodTransactions.reduce((s, t) => s + t.amountCents, 0);
     const isCurrentYear = Number(todayStr.slice(0, 4)) === year;
     const denom = isCurrentYear ? Math.max(1, Number(todayStr.slice(5, 7))) : 12;
     avg = Math.round(total / denom);
   }
 
   const rankList: RankItem[] = Array.from(byCat.entries())
-    .map(([cid, cents]) => ({
+    .map(([cid, info]) => ({
       cat: getCategory(cid),
-      cents,
-      pct: total > 0 ? (cents / total) * 100 : 0,
+      cents: info.cents,
+      count: info.count,
+      pct: total > 0 ? (info.cents / total) * 100 : 0,
     }))
     .sort((a, b) => b.cents - a.cents);
 
-  return { points, total, avg, rankList };
+  return { points, total, avg, rankList, periodTransactions };
 }
