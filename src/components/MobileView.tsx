@@ -11,14 +11,17 @@ import {
   getYearMonthRows,
 } from '@/lib/analytics';
 import {
+  addDays,
   daysInMonth,
   downloadCsv,
   evalCalcExpr,
+  filterTransactionsByDateRange,
   fmtNum,
   getMonthPrefix,
   getRecentWeeks,
   getTodayStr,
   getWeekday,
+  normalizeDateRange,
   pad2,
   splitMoneyParts,
 } from '@/lib/format';
@@ -51,6 +54,7 @@ interface Props {
   storageMode: 'supabase' | 'local';
   pinEnabled: boolean;
   syncing: boolean;
+  initialLoading?: boolean;
   onCreateTx: (draft: TxDraft) => Promise<Transaction | null>;
   onUpdateTx: (id: number, patch: Partial<TxDraft>) => Promise<Transaction | null>;
   onDeleteTx: (id: number) => Promise<boolean>;
@@ -82,6 +86,7 @@ export default function MobileView({
   storageMode,
   pinEnabled,
   syncing,
+  initialLoading = false,
   onCreateTx,
   onUpdateTx,
   onDeleteTx,
@@ -135,7 +140,9 @@ export default function MobileView({
 
   // Export / Import state
   const [dataTab, setDataTab] = useState<'export' | 'import'>('export');
-  const [exportScope, setExportScope] = useState<'month' | 'year' | 'all'>('month');
+  const [exportScope, setExportScope] = useState<'month' | 'year' | 'range' | 'all'>('month');
+  const [exportStartDate, setExportStartDate] = useState(`${todayStr.slice(0, 7)}-01`);
+  const [exportEndDate, setExportEndDate] = useState(todayStr);
   const [importFileName, setImportFileName] = useState('');
   const [importPreview, setImportPreview] = useState<CsvParseResult | null>(null);
   const [skipDuplicates, setSkipDuplicates] = useState(true);
@@ -205,6 +212,12 @@ export default function MobileView({
     else if (kind === 'entryDate') {
       const [y, m, d] = entryDate.split('-').map(Number);
       setPickerReq({ kind, year: y || todayYear, month: m || todayMonth, day: d || 1 });
+    } else if (kind === 'exportStart') {
+      const [y, m, d] = exportStartDate.split('-').map(Number);
+      setPickerReq({ kind, year: y || todayYear, month: m || todayMonth, day: d || 1 });
+    } else if (kind === 'exportEnd') {
+      const [y, m, d] = exportEndDate.split('-').map(Number);
+      setPickerReq({ kind, year: y || todayYear, month: m || todayMonth, day: d || 1 });
     }
   };
 
@@ -231,6 +244,14 @@ export default function MobileView({
       setCalSelectedDate(`${y}-${pad2(m)}-${pad2(keepD)}`);
     } else if (kind === 'entryDate') {
       setEntryDate(`${y}-${pad2(m)}-${pad2(d)}`);
+    } else if (kind === 'exportStart') {
+      const picked = `${y}-${pad2(m)}-${pad2(d)}`;
+      setExportStartDate(picked);
+      if (picked > exportEndDate) setExportEndDate(picked);
+    } else if (kind === 'exportEnd') {
+      const picked = `${y}-${pad2(m)}-${pad2(d)}`;
+      setExportEndDate(picked);
+      if (picked < exportStartDate) setExportStartDate(picked);
     }
     setPickerReq(null);
   };
@@ -294,7 +315,10 @@ export default function MobileView({
     }
   };
 
-  const getExportList = (scope: 'month' | 'year' | 'all') => {
+  const getExportList = (scope: 'month' | 'year' | 'range' | 'all') => {
+    if (scope === 'range') {
+      return filterTransactionsByDateRange(transactions, exportStartDate, exportEndDate);
+    }
     const sorted = [...transactions].sort((a, b) =>
       a.date === b.date ? b.id - a.id : b.date.localeCompare(a.date),
     );
@@ -308,13 +332,42 @@ export default function MobileView({
     return sorted;
   };
 
-  const handleDownloadCsv = (scope: 'month' | 'year' | 'all') => {
+  const applyExportPreset = (preset: 'last7' | 'last30' | 'thisMonth' | 'lastMonth' | 'thisYear') => {
+    setExportScope('range');
+    if (preset === 'last7') {
+      setExportStartDate(addDays(todayStr, -6));
+      setExportEndDate(todayStr);
+    } else if (preset === 'last30') {
+      setExportStartDate(addDays(todayStr, -29));
+      setExportEndDate(todayStr);
+    } else if (preset === 'thisMonth') {
+      setExportStartDate(`${todayYear}-${pad2(todayMonth)}-01`);
+      setExportEndDate(todayStr);
+    } else if (preset === 'lastMonth') {
+      const prevY = todayMonth === 1 ? todayYear - 1 : todayYear;
+      const prevM = todayMonth === 1 ? 12 : todayMonth - 1;
+      setExportStartDate(`${prevY}-${pad2(prevM)}-01`);
+      setExportEndDate(`${prevY}-${pad2(prevM)}-${pad2(daysInMonth(prevY, prevM))}`);
+    } else if (preset === 'thisYear') {
+      setExportStartDate(`${todayYear}-01-01`);
+      setExportEndDate(todayStr);
+    }
+  };
+
+  const handleDownloadCsv = (scope: 'month' | 'year' | 'range' | 'all') => {
     const list = getExportList(scope);
+    if (list.length === 0) {
+      showToast('当前范围暂无可导出记录');
+      return;
+    }
+    const { start, end } = normalizeDateRange(exportStartDate, exportEndDate);
     const suffix =
       scope === 'month'
         ? `${feedYear}年${feedMonth}月`
         : scope === 'year'
         ? `${feedYear}年`
+        : scope === 'range'
+        ? `${start}_至_${end}`
         : '全部账单';
     downloadCsv(list, `简账_${suffix}.csv`);
     showToast(`已导出 ${list.length} 条账单`);
@@ -674,6 +727,11 @@ export default function MobileView({
                 </div>
               );
             })
+          ) : initialLoading ? (
+            <div className="py-16 px-6 text-center space-y-2.5">
+              <div className="w-7 h-7 mx-auto rounded-full border-2 border-[#FFDA44] border-t-transparent animate-spin" />
+              <div className="text-xs text-[#999999]">正在同步云端账单...</div>
+            </div>
           ) : (
             <div className="py-16 px-6 text-center space-y-3">
               <div className="text-3xl">📝</div>
@@ -2584,13 +2642,14 @@ export default function MobileView({
 
       {dataTab === 'export' ? (
         <div className="p-3.5 space-y-3">
-          <div className="bg-white rounded-2xl p-4 space-y-2.5 border border-[#F0F0F0]">
+          <div className="bg-white rounded-2xl p-4 space-y-3 border border-[#F0F0F0]">
             <div className="text-xs font-semibold text-[#555555]">选择导出范围</div>
-            <div className="grid grid-cols-3 gap-2 text-xs">
+            <div className="grid grid-cols-2 gap-2 text-xs">
               {(
                 [
                   ['month', `${feedYear}年${feedMonth}月`],
                   ['year', `${feedYear}年全年`],
+                  ['range', '起止日期'],
                   ['all', '全部账单'],
                 ] as const
               ).map(([k, lbl]) => (
@@ -2598,7 +2657,7 @@ export default function MobileView({
                   key={k}
                   type="button"
                   onClick={() => setExportScope(k)}
-                  className={`py-2 px-1 rounded-xl border text-center font-medium transition-colors ${
+                  className={`py-2 px-2 rounded-xl border text-center font-medium transition-colors ${
                     exportScope === k
                       ? 'shark-yellow border-[#E5C100] font-bold text-[#222222]'
                       : 'bg-[#FAFAFA] border-[#EAEAEA] text-[#666666]'
@@ -2608,6 +2667,55 @@ export default function MobileView({
                 </button>
               ))}
             </div>
+
+            {exportScope === 'range' && (
+              <div className="pt-1 space-y-2.5">
+                <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => openPicker('exportStart')}
+                    className="px-3 py-2 rounded-xl bg-[#FAFAFA] border border-[#E5E5E5] text-left active:bg-[#FFF8D6]"
+                  >
+                    <div className="text-[10px] text-[#999999]">开始日期</div>
+                    <div className="text-xs font-semibold text-[#222222] tabular-nums mt-0.5">
+                      {exportStartDate}
+                    </div>
+                  </button>
+                  <span className="text-xs text-[#999999]">至</span>
+                  <button
+                    type="button"
+                    onClick={() => openPicker('exportEnd')}
+                    className="px-3 py-2 rounded-xl bg-[#FAFAFA] border border-[#E5E5E5] text-left active:bg-[#FFF8D6]"
+                  >
+                    <div className="text-[10px] text-[#999999]">结束日期</div>
+                    <div className="text-xs font-semibold text-[#222222] tabular-nums mt-0.5">
+                      {exportEndDate}
+                    </div>
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap gap-1.5 text-[11px]">
+                  {(
+                    [
+                      ['last7', '近7天'],
+                      ['last30', '近30天'],
+                      ['thisMonth', '本月'],
+                      ['lastMonth', '上月'],
+                      ['thisYear', '今年'],
+                    ] as const
+                  ).map(([preset, lbl]) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => applyExportPreset(preset)}
+                      className="px-2.5 py-1 rounded-full bg-[#F5F5F5] text-[#555555] active:bg-[#FFF8D6]"
+                    >
+                      {lbl}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="bg-white rounded-2xl p-4 space-y-2.5 border border-[#F0F0F0]">
@@ -2805,6 +2913,11 @@ export default function MobileView({
       )}
 
       {renderBottomNav()}
+      <MobilePickerSheet
+        request={pickerReq}
+        onClose={() => setPickerReq(null)}
+        onConfirm={handlePickerConfirm}
+      />
     </div>
   );
 }

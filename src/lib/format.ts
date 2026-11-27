@@ -95,6 +95,33 @@ export function getRecentWeeks(todayStr: string, count = 6): WeekOption[] {
   return list;
 }
 
+export function normalizeDateRange(
+  startDate: string,
+  endDate: string,
+): { start: string; end: string } {
+  const s = startDate.trim();
+  const e = endDate.trim();
+  if (s && e && s > e) {
+    return { start: e, end: s };
+  }
+  return { start: s, end: e };
+}
+
+export function filterTransactionsByDateRange(
+  transactions: Transaction[],
+  startDate: string,
+  endDate: string,
+): Transaction[] {
+  const { start, end } = normalizeDateRange(startDate, endDate);
+  return transactions
+    .filter((t) => {
+      if (start && t.date < start) return false;
+      if (end && t.date > end) return false;
+      return true;
+    })
+    .sort((a, b) => (a.date === b.date ? b.id - a.id : b.date.localeCompare(a.date)));
+}
+
 export function formatPurpose(tx: Transaction): string {
   return getCategory(tx.categoryId).name;
 }

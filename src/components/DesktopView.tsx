@@ -15,14 +15,17 @@ import {
   getYearMonthRows,
 } from '@/lib/analytics';
 import {
+  addDays,
   daysInMonth,
   downloadCsv,
+  filterTransactionsByDateRange,
   fmtNum,
   getMonthPrefix,
   getRecentWeeks,
   getTodayStr,
   MAX_YEAR,
   MIN_YEAR,
+  normalizeDateRange,
   pad2,
   splitMoneyParts,
 } from '@/lib/format';
@@ -44,6 +47,7 @@ interface Props {
   storageMode: 'supabase' | 'local';
   pinEnabled: boolean;
   syncing: boolean;
+  initialLoading?: boolean;
   onCreateTx: (draft: TxDraft) => Promise<Transaction | null>;
   onUpdateTx: (id: number, patch: Partial<TxDraft>) => Promise<Transaction | null>;
   onDeleteTx: (id: number) => Promise<boolean>;
@@ -151,6 +155,11 @@ export default function DesktopView({
   const [importPreview, setImportPreview] = useState<CsvParseResult | null>(null);
   const [skipDuplicates, setSkipDuplicates] = useState(true);
 
+  // Custom date-range CSV export state
+  const [exportRangeOpen, setExportRangeOpen] = useState(false);
+  const [exportStartDate, setExportStartDate] = useState(`${todayStr.slice(0, 7)}-01`);
+  const [exportEndDate, setExportEndDate] = useState(todayStr);
+
   const monthTotals = getMonthTotals(transactions, viewYear, viewMonth, excludeInvestment);
   const prefix = getMonthPrefix(viewYear, viewMonth);
 
@@ -236,15 +245,47 @@ export default function DesktopView({
     showToast('已记一笔');
   };
 
-  const handleExport = (scope: 'month' | 'all') => {
+  const rangeExportList = useMemo(
+    () => filterTransactionsByDateRange(transactions, exportStartDate, exportEndDate),
+    [transactions, exportStartDate, exportEndDate],
+  );
+
+  const handleExport = (scope: 'month' | 'range' | 'all') => {
     const list =
       scope === 'month'
         ? transactions.filter((t) => t.date.startsWith(prefix))
+        : scope === 'range'
+        ? rangeExportList
         : transactions;
+    if (list.length === 0) {
+      showToast('当前范围暂无可导出记录');
+      return;
+    }
+    const { start, end } = normalizeDateRange(exportStartDate, exportEndDate);
     const filename =
-      scope === 'month' ? `简账_${viewYear}年${viewMonth}月.csv` : '简账_全部账单.csv';
+      scope === 'month'
+        ? `简账_${viewYear}年${viewMonth}月.csv`
+        : scope === 'range'
+        ? `简账_${start}_至_${end}.csv`
+        : '简账_全部账单.csv';
     downloadCsv(list, filename);
     showToast(`已导出 ${list.length} 条记录（时间/收支/用途/金额/备注）`);
+  };
+
+  const applyDesktopExportPreset = (preset: 'last7' | 'last30' | 'thisMonth' | 'thisYear') => {
+    if (preset === 'last7') {
+      setExportStartDate(addDays(todayStr, -6));
+      setExportEndDate(todayStr);
+    } else if (preset === 'last30') {
+      setExportStartDate(addDays(todayStr, -29));
+      setExportEndDate(todayStr);
+    } else if (preset === 'thisMonth') {
+      setExportStartDate(`${todayYear}-${pad2(todayMonth)}-01`);
+      setExportEndDate(todayStr);
+    } else if (preset === 'thisYear') {
+      setExportStartDate(`${todayYear}-01-01`);
+      setExportEndDate(todayStr);
+    }
   };
 
   const handleDesktopFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -462,6 +503,68 @@ export default function DesktopView({
             >
               导出 {viewYear}年{viewMonth}月
             </button>
+            <button
+              type="button"
+              onClick={() => setExportRangeOpen((v) => !v)}
+              className="w-full py-2 rounded-xl border border-[#E5E5E5] text-xs font-medium text-[#333333] hover:bg-[#FAFAFA] flex items-center justify-center gap-1"
+            >
+              <span>按起止日期导出</span>
+              <span className="text-[10px] text-[#888888]">{exportRangeOpen ? '▴' : '▾'}</span>
+            </button>
+            {exportRangeOpen && (
+              <div className="p-2.5 rounded-xl bg-[#FAFAFA] border border-[#EAEAEA] space-y-2">
+                <div className="space-y-1.5">
+                  <label className="block text-[11px] text-[#666666]">
+                    开始日期
+                    <input
+                      type="date"
+                      min="1949-01-01"
+                      max="2100-12-31"
+                      value={exportStartDate}
+                      onChange={(e) => setExportStartDate(e.target.value)}
+                      className="mt-0.5 w-full px-2 py-1 rounded-lg bg-white border border-[#E0E0E0] text-xs tabular-nums"
+                    />
+                  </label>
+                  <label className="block text-[11px] text-[#666666]">
+                    结束日期
+                    <input
+                      type="date"
+                      min="1949-01-01"
+                      max="2100-12-31"
+                      value={exportEndDate}
+                      onChange={(e) => setExportEndDate(e.target.value)}
+                      className="mt-0.5 w-full px-2 py-1 rounded-lg bg-white border border-[#E0E0E0] text-xs tabular-nums"
+                    />
+                  </label>
+                </div>
+                <div className="flex flex-wrap gap-1 text-[10px]">
+                  {(
+                    [
+                      ['last7', '近7天'],
+                      ['last30', '近30天'],
+                      ['thisMonth', '本月'],
+                      ['thisYear', '今年'],
+                    ] as const
+                  ).map(([preset, lbl]) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => applyDesktopExportPreset(preset)}
+                      className="px-2 py-0.5 rounded-full bg-white border border-[#E5E5E5] text-[#555555] hover:bg-[#FFF8D6]"
+                    >
+                      {lbl}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleExport('range')}
+                  className="w-full py-1.5 rounded-lg shark-yellow text-xs font-bold text-[#222222] hover:opacity-90"
+                >
+                  导出所选时段（{rangeExportList.length} 条）
+                </button>
+              </div>
+            )}
             <button
               type="button"
               onClick={() => handleExport('all')}

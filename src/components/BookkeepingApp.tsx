@@ -1,10 +1,9 @@
 'use client';
 
-import { useCallback, useRef, useState } from 'react';
+import dynamic from 'next/dynamic';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { BudgetSettings, Transaction, TxType } from '@/lib/types';
 import { addDays, getTodayStr } from '@/lib/format';
-import MobileView from './MobileView';
-import DesktopView from './DesktopView';
 
 export interface TxDraft {
   type: TxType;
@@ -15,10 +14,76 @@ export interface TxDraft {
 }
 
 interface Props {
-  initialTransactions: Transaction[];
-  initialBudget: BudgetSettings;
+  initialTransactions?: Transaction[];
+  initialBudget?: BudgetSettings;
   storageMode: 'supabase' | 'local';
   pinEnabled: boolean;
+}
+
+const DEFAULT_BUDGET: BudgetSettings = {
+  monthlyCents: 200000,
+  monthlyOverrides: {},
+  categories: {},
+  recurringTemplates: [],
+};
+
+const CACHE_KEY = 'jianzhang_cache_v1';
+const PAGE_CACHE_NAME = 'jianzhang-pages-v1';
+
+interface CachedSnapshot {
+  transactions: Transaction[];
+  budget: BudgetSettings;
+  savedAt: number;
+}
+
+function readLocalCache(): CachedSnapshot | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<CachedSnapshot>;
+    if (!Array.isArray(parsed.transactions) || !parsed.budget) return null;
+    return {
+      transactions: parsed.transactions,
+      budget: {
+        monthlyCents: Number(parsed.budget.monthlyCents ?? 200000),
+        monthlyOverrides: parsed.budget.monthlyOverrides || {},
+        categories: parsed.budget.categories || {},
+        recurringTemplates: Array.isArray(parsed.budget.recurringTemplates)
+          ? parsed.budget.recurringTemplates
+          : [],
+      },
+      savedAt: Number(parsed.savedAt || 0),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalCache(transactions: Transaction[], budget: BudgetSettings): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const payload: CachedSnapshot = {
+      transactions,
+      budget,
+      savedAt: Date.now(),
+    };
+    window.localStorage.setItem(CACHE_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore storage quota or private-mode errors
+  }
+}
+
+function clearClientCaches(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.removeItem(CACHE_KEY);
+  } catch {
+    // ignore
+  }
+  if ('caches' in window) {
+    void window.caches.delete(PAGE_CACHE_NAME).catch(() => undefined);
+  }
 }
 
 function sortTransactions(list: Transaction[]): Transaction[] {
@@ -27,19 +92,70 @@ function sortTransactions(list: Transaction[]): Transaction[] {
   );
 }
 
+function MobileBootShell() {
+  return (
+    <div className="min-h-screen bg-[#F7F8FA] flex flex-col">
+      <header className="shark-yellow px-4 pt-3 pb-6">
+        <div className="flex items-center justify-between mb-4">
+          <div className="text-[11px] text-[#555555] flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#F59E0B] animate-pulse inline-block" />
+            <span>启动中</span>
+          </div>
+          <div className="text-base font-bold tracking-wide text-[#222222]">简账</div>
+          <div className="w-16" />
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          <div className="h-10 rounded-lg bg-black/5 animate-pulse" />
+          <div className="h-10 rounded-lg bg-black/5 animate-pulse" />
+          <div className="h-10 rounded-lg bg-black/5 animate-pulse" />
+        </div>
+      </header>
+      <div className="px-3 -mt-3 space-y-3">
+        <div className="h-16 rounded-2xl bg-white shadow-sm animate-pulse" />
+        <div className="h-24 rounded-2xl bg-white animate-pulse" />
+        <div className="h-24 rounded-2xl bg-white animate-pulse" />
+      </div>
+    </div>
+  );
+}
+
+function DesktopBootShell() {
+  return (
+    <div className="min-h-screen bg-[#F7F8FA] flex items-center justify-center text-sm text-[#888888]">
+      正在加载简账工作台...
+    </div>
+  );
+}
+
+// Split Mobile and Desktop bundles so mobile phones never download/parse/render DesktopView
+const MobileView = dynamic(() => import('./MobileView'), {
+  ssr: false,
+  loading: () => <MobileBootShell />,
+});
+
+const DesktopView = dynamic(() => import('./DesktopView'), {
+  ssr: false,
+  loading: () => <DesktopBootShell />,
+});
+
 export default function BookkeepingApp({
   initialTransactions,
   initialBudget,
   storageMode,
   pinEnabled,
 }: Props) {
-  const [transactions, setTransactions] = useState<Transaction[]>(initialTransactions);
-  const [budget, setBudget] = useState<BudgetSettings>(initialBudget);
+  const hasServerSeed = initialTransactions !== undefined && initialBudget !== undefined;
+  const [transactions, setTransactions] = useState<Transaction[]>(initialTransactions ?? []);
+  const [budget, setBudget] = useState<BudgetSettings>(initialBudget ?? DEFAULT_BUDGET);
   const [toast, setToast] = useState<string>('');
   const [pendingCount, setPendingCount] = useState<number>(0);
+  const [bgRefreshing, setBgRefreshing] = useState<boolean>(!hasServerSeed);
+  const [hasLoadedData, setHasLoadedData] = useState<boolean>(hasServerSeed);
+  const [viewportMode, setViewportMode] = useState<'unknown' | 'mobile' | 'desktop'>('unknown');
   const tempIdSeq = useRef(-1);
 
-  const syncing = pendingCount > 0;
+  const syncing = pendingCount > 0 || bgRefreshing;
+  const initialLoading = !hasLoadedData && bgRefreshing;
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -48,9 +164,31 @@ export default function BookkeepingApp({
     }, 2400);
   }, []);
 
+  // Register lightweight PWA Service Worker for instant static-asset & shell loading
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.register('/sw.js').catch(() => undefined);
+  }, []);
+
+  // Detect mobile vs desktop once on mount and on window resize
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mq = window.matchMedia('(min-width: 768px)');
+    const syncViewport = () => setViewportMode(mq.matches ? 'desktop' : 'mobile');
+    syncViewport();
+    mq.addEventListener('change', syncViewport);
+    return () => mq.removeEventListener('change', syncViewport);
+  }, []);
+
   const refreshAll = useCallback(async () => {
+    setBgRefreshing(true);
     try {
       const res = await fetch('/api/transactions', { cache: 'no-store' });
+      if (res.status === 401) {
+        clearClientCaches();
+        window.location.reload();
+        return;
+      }
       if (!res.ok) return;
       const data = (await res.json()) as {
         transactions: Transaction[];
@@ -58,10 +196,33 @@ export default function BookkeepingApp({
       };
       setTransactions(data.transactions);
       setBudget(data.budget);
+      setHasLoadedData(true);
+      writeLocalCache(data.transactions, data.budget);
     } catch {
-      // ignore transient errors
+      // Offline or transient network error: keep showing local cache silently
+    } finally {
+      setBgRefreshing(false);
     }
   }, []);
+
+  // Hydrate immediately from localStorage cache (<10ms), then refresh from cloud in background
+  useEffect(() => {
+    const cached = readLocalCache();
+    if (cached && !hasServerSeed) {
+      setTransactions(cached.transactions);
+      setBudget(cached.budget);
+      setHasLoadedData(true);
+    }
+    if (!hasServerSeed) {
+      void refreshAll();
+    }
+  }, [hasServerSeed, refreshAll]);
+
+  // Keep local cache in sync after any local optimistic mutation or server sync
+  useEffect(() => {
+    if (!hasLoadedData) return;
+    writeLocalCache(transactions, budget);
+  }, [hasLoadedData, transactions, budget]);
 
   // Optimistic Create: updates UI immediately (0ms feel), syncs in background
   const handleCreateTx = useCallback(
@@ -78,6 +239,7 @@ export default function BookkeepingApp({
       };
 
       setTransactions((prev) => sortTransactions([optimistic, ...prev]));
+      setHasLoadedData(true);
       setPendingCount((c) => c + 1);
 
       void (async () => {
@@ -263,6 +425,7 @@ export default function BookkeepingApp({
         };
         if (data.imported.length > 0) {
           setTransactions((prev) => sortTransactions([...data.imported, ...prev]));
+          setHasLoadedData(true);
         }
         const msg =
           data.skippedDuplicates > 0
@@ -288,6 +451,7 @@ export default function BookkeepingApp({
     async (next: BudgetSettings): Promise<boolean> => {
       const prevBudget = budget;
       setBudget(next);
+      setHasLoadedData(true);
       showToast('已保存');
       setPendingCount((c) => c + 1);
 
@@ -333,6 +497,7 @@ export default function BookkeepingApp({
   }, [handleImportTx]);
 
   const handleLogout = useCallback(async () => {
+    clearClientCaches();
     await fetch('/api/auth', { method: 'DELETE' });
     window.location.reload();
   }, []);
@@ -343,6 +508,7 @@ export default function BookkeepingApp({
     storageMode,
     pinEnabled,
     syncing,
+    initialLoading,
     onCreateTx: handleCreateTx,
     onUpdateTx: handleUpdateTx,
     onDeleteTx: handleDeleteTx,
@@ -357,16 +523,22 @@ export default function BookkeepingApp({
 
   return (
     <>
-      <div className="md:hidden">
-        <MobileView {...sharedProps} />
-      </div>
+      {viewportMode === 'unknown' && (
+        <>
+          <div className="md:hidden">
+            <MobileBootShell />
+          </div>
+          <div className="hidden md:block">
+            <DesktopBootShell />
+          </div>
+        </>
+      )}
 
-      <div className="hidden md:block">
-        <DesktopView {...sharedProps} />
-      </div>
+      {viewportMode === 'mobile' && <MobileView {...sharedProps} />}
+      {viewportMode === 'desktop' && <DesktopView {...sharedProps} />}
 
       {toast && (
-        <div className="fixed bottom-20 md:bottom-8 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-full bg-[#333333] text-white text-xs font-medium shadow-lg pointer-events-none">
+        <div className="fixed bottom-32 md:bottom-8 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-full bg-[#333333] text-white text-xs font-medium shadow-lg pointer-events-none">
           {toast}
         </div>
       )}

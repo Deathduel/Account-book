@@ -1,5 +1,5 @@
 import { isAuthenticated, isPinEnabled } from '@/lib/auth';
-import { getSnapshot } from '@/lib/storage';
+import { getStorageMode } from '@/lib/storage';
 import BookkeepingApp from '@/components/BookkeepingApp';
 import PinLockScreen from '@/components/PinLockScreen';
 
@@ -11,13 +11,9 @@ export default async function HomePage() {
     return <PinLockScreen />;
   }
 
-  const snapshot = await getSnapshot();
-
   return (
     <BookkeepingApp
-      initialTransactions={snapshot.transactions}
-      initialBudget={snapshot.budget}
-      storageMode={snapshot.storageMode}
+      storageMode={getStorageMode()}
       pinEnabled={isPinEnabled()}
     />
   );

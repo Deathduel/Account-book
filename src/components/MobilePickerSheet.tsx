@@ -3,7 +3,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { addDays, daysInMonth, getTodayStr, MAX_YEAR, MIN_YEAR, pad2 } from '@/lib/format';
 
-export type PickerKind = 'feedYM' | 'billYear' | 'chartYM' | 'chartYear' | 'calYM' | 'entryDate';
+export type PickerKind =
+  | 'feedYM'
+  | 'billYear'
+  | 'chartYM'
+  | 'chartYear'
+  | 'calYM'
+  | 'entryDate'
+  | 'exportStart'
+  | 'exportEnd';
 
 export interface PickerRequest {
   kind: PickerKind;
@@ -164,13 +172,19 @@ export default function MobilePickerSheet({ request, onClose, onConfirm }: Props
     );
   }
 
-  // entryDate
+  // Full date picker: entryDate / exportStart / exportEnd
   const totalDays = daysInMonth(year, month);
   const firstWeekday = new Date(year, month - 1, 1).getDay();
+  const datePickerTitle =
+    request.kind === 'exportStart'
+      ? '选择导出开始日期'
+      : request.kind === 'exportEnd'
+      ? '选择导出结束日期'
+      : '选择记账日期';
 
   const pickQuick = (ds: string) => {
     const [y, m, d] = ds.split('-').map(Number);
-    onConfirm('entryDate', y, m, d);
+    onConfirm(request.kind, y, m, d);
   };
 
   return (
@@ -183,10 +197,10 @@ export default function MobilePickerSheet({ request, onClose, onConfirm }: Props
           <button type="button" onClick={onClose} className="text-[#888888]">
             取消
           </button>
-          <span className="font-semibold">选择记账日期</span>
+          <span className="font-semibold">{datePickerTitle}</span>
           <button
             type="button"
-            onClick={() => onConfirm('entryDate', year, month, day)}
+            onClick={() => onConfirm(request.kind, year, month, day)}
             className="font-semibold text-[#222222]"
           >
             确定
@@ -255,7 +269,7 @@ export default function MobilePickerSheet({ request, onClose, onConfirm }: Props
                 <button
                   key={d}
                   type="button"
-                  onClick={() => onConfirm('entryDate', year, month, d)}
+                  onClick={() => onConfirm(request.kind, year, month, d)}
                   className={`h-9 rounded-lg text-xs tabular-nums transition-colors ${
                     sel
                       ? 'shark-yellow font-bold text-[#222222]'

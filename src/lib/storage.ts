@@ -25,11 +25,18 @@ const DEFAULT_BUDGET: BudgetSettings = {
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DATA_FILE = path.join(DATA_DIR, 'ledger.json');
 
+let cachedSbKey = '';
+let cachedSbClient: SupabaseClient | null = null;
+
 function getSupabaseClient(): SupabaseClient | null {
   const url = process.env.SUPABASE_URL?.trim();
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
   if (!url || !key) return null;
-  return createClient(url, key, { auth: { persistSession: false } });
+  const sig = `${url}|${key}`;
+  if (cachedSbClient && cachedSbKey === sig) return cachedSbClient;
+  cachedSbKey = sig;
+  cachedSbClient = createClient(url, key, { auth: { persistSession: false } });
+  return cachedSbClient;
 }
 
 export function getStorageMode(): 'supabase' | 'local' {
